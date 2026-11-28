@@ -1,0 +1,33 @@
+# Licence of the Loom programs in this card
+
+The `.loom` programs, `model.json` and `llm_config.json` were generated with [loom-skills](https://github.com/loom-fun/loom-skills) and derive from loom-fun/ggml-org-Qwen3-4B-loom@b0944ed9 (checkpoint re-pointed to unsloth/Qwen3-4B-GGUF by cl-loomfun). They are MIT-licensed:
+
+```
+MIT License
+
+Copyright (c) 2026 Loom Fun contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+Parts of the generated kernels and the text-service glue are adapted from [ROCm/hrx-loom-library](https://github.com/ROCm/hrx-loom-library), MIT, Copyright (c) 2026 AMD ROCm(TM) Software (per loom-skills THIRD_PARTY_NOTICES.md).
+
+The model weights are NOT part of this card and keep their own licence: `apache-2.0` (unsloth/Qwen3-4B-GGUF).
+
+The card also loads `Qwen3-4B-DFlash.Q8_0.gguf` from [AtomicChat/Qwen3-4B-DFlash-GGUF](https://huggingface.co/AtomicChat/Qwen3-4B-DFlash-GGUF) at revision `700be51d025f928249abf1c72aef735961051e23` (origin `drafter`), licence `mit`; not part of this card either.

@@ -18,3 +18,20 @@ Not shipped: the model weights, the card's DSpark drafter and the MXFP8 expert s
           the 16 published MXFP8 tensors of layers 20-23, byte-identical to thinkingmachines/Inkling-2-Mini (Apache-2.0).
           Lemonade's catalogue pull downloads the named files on the user's request, and serve links the card's
           parameter/ files to the pulled model by the lock's sha256.
+
+Card: Qwen3-4B-GGUF-loom (1bit-MONSTER), Hugging Face 1bit-MONSTER/Qwen3-4B-GGUF-loom (public), revision
+          cbcad87c1185edd1ce64a5ed782c10feb65cac90, 15 files pinned by sha256 and size (.gitattributes not carried). Generated
+          with the stock loom-skills kit, from loom-fun/ggml-org-Qwen3-4B-loom@b0944ed9 with the checkpoint re-pointed to
+          unsloth/Qwen3-4B-GGUF (cl-loomfun); built for hrx-loom 0.3.0 (the image's loom-serve, config/loom.config).
+          Its lock pins the route's GGUF (Qwen3-4B-Q4_K_M.gguf, sha256 f6f85177..., 2497281312 B, = config/loom-routes.json).
+License: the card Apache-2.0; its .loom programs, model.json and llm_config.json MIT (Loom Fun contributors), kept here
+          as Qwen3-4B-GGUF-loom.LICENSE (the card's LICENSE-programs.md).
+Not shipped: the weights (unsloth/Qwen3-4B-GGUF) and the DFlash drafter (AtomicChat/Qwen3-4B-DFlash-GGUF) its lock names.
+
+Card: Qwen3.5-4B-GGUF-loom (1bit-MONSTER), Hugging Face 1bit-MONSTER/Qwen3.5-4B-GGUF-loom (public), revision
+          31e3982a8da84275a49585c7681b21906e72c02f, 19 files pinned by sha256 and size (.gitattributes not carried). Generated
+          with the stock loom-skills kit (port.sh @618f89e1) from loom-fun/unsloth-Qwen3.5-4B-loom@64bf40259 for unsloth
+          UD-Q4_K_XL (cl-loomfun); hrx-loom 0.3.0; engine#3158 gate pass on 0.3.0 (issuecomment-7115828650). Its lock pins
+          the route's GGUF (Qwen3.5-4B-UD-Q4_K_XL.gguf, sha256 b252c561..., 2912109728 B) and mmproj-F16.gguf.
+License: the card Apache-2.0; programs MIT (Loom Fun contributors), kept here as Qwen3.5-4B-GGUF-loom.LICENSE.
+Not shipped: the weights, the projector and the drafter its lock names.

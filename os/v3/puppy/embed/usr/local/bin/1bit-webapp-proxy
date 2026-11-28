@@ -544,8 +544,18 @@ def _add_known(ip):
             pass
 
 
+# test hook (inert as root, like the others): every backoff is this many seconds, so a test of the per-address count under
+# concurrency does not depend on all its requests arriving inside the real 2 s first window (a loaded CI runner did not:
+# 5 checks instead of 4, 2026-11-28)
+_TEST_BACKOFF = "" if _AS_ROOT else os.environ.get("ONEBIT_WEBAPP_TEST_BACKOFF_S", "")
+
+
 def _backoff(n):
-    return 0.0 if n <= FREE_TRIES else min(BACKOFF_MAX, 2.0 ** (n - FREE_TRIES))
+    if n <= FREE_TRIES:
+        return 0.0
+    if _TEST_BACKOFF:
+        return float(_TEST_BACKOFF)
+    return min(BACKOFF_MAX, 2.0 ** (n - FREE_TRIES))
 
 
 def _reserve(ip, now):

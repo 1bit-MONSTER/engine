@@ -109,7 +109,9 @@ stop
 # by others' failures (127.0.0.x are all loopback: each is its own client address here; the 5-min sign-in cache is
 # off in this part, so the known-address rule is tested on its own)
 export ONEBIT_WEBAPP_KNOWN=$t/known ONEBIT_WEBAPP_TEST_OK_TTL=0
-start || { echo "FAIL the proxy did not start"; exit 1; }
+# the COUNT under concurrency, on its own proxy with a 60 s backoff (test hook): with the real 2 s first window, a loaded CI
+# runner let one of the 16 arrive after it (5 checks, 11 x 429: right behaviour, flaky test)
+ONEBIT_WEBAPP_TEST_BACKOFF_S=60 start || { echo "FAIL the proxy did not start"; exit 1; }
 for _ in $(seq 30); do [ "$(L "https://127.0.0.1:$lport/")" != 000 ] && break; sleep 0.1; done
 : > "$t/checks"; : > "$t/par"
 pids=
@@ -117,6 +119,11 @@ for i in $(seq 1 16); do curl -sk -o /dev/null -w '%{http_code}\n' --interface 1
 for p in $pids; do wait "$p"; done                  # the curls only: a bare wait would wait for the proxy too
 [ "$(wc -l < "$t/checks")" = 4 ] && [ "$(grep -c '^429$' "$t/par")" = 12 ]
 check $? "16 concurrent wrong sign-ins from one address make exactly 4 password checks (3 free, then the backoff): $(wc -l < "$t/checks") checks, $(grep -c '^429$' "$t/par") x 429"
+stop; rm -f "$t/known"
+# the rest with the real backoff: a fresh proxy, the backoff armed again by 4 wrong sign-ins in a row (3 free + 1)
+start || { echo "FAIL the proxy did not start"; exit 1; }
+for _ in $(seq 30); do [ "$(L "https://127.0.0.1:$lport/")" != 000 ] && break; sleep 0.1; done
+for i in 1 2 3 4; do L --interface 127.0.0.9 -u "root:wrong-seq-$i-password" "https://127.0.0.1:$lport/1bit/update/status" > /dev/null; done
 curl -sk -u "root:$PW" --interface 127.0.0.9 -D "$t/hdr" -o /dev/null "https://127.0.0.1:$lport/1bit/update/status"
 grep -q '^HTTP/1.1 429' "$t/hdr" && grep -qi '^Retry-After: [12]' "$t/hdr"; check $? "inside its backoff the address gets 429 + Retry-After, even with the right password"
 sleep 2.2

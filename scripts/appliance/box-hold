@@ -36,7 +36,34 @@
 # at a time (a third queues as a lane, reported), the same 45-min cap.
 set -u
 D=${BOX_HOLD_DIR:-/tmp/box-locks}; mkdir -p $D 2>/dev/null; chmod 1777 $D 2>/dev/null; (umask 000; touch $D/box-gpu.lock $D/box-npu.lock $D/box-gpu.who $D/box-npu.who) 2>/dev/null; chmod 666 $D/box-* 2>/dev/null
-dev=${1:?usage: box-hold <gpu|npu|both> <command...>}; shift
+# v5.1 (2026-11-28 orchestrator; found by cl-npuconc): seed the age record of every live lane ticket that has none.
+# v5 writes a job's record on its FIRST v5 submission, so a ticket queued under an older copy had none, and when its
+# wait ran out the re-submission went to the BACK. The ticket file itself holds what the record needs: its queue number
+# (the file name) and the line "<label> <date> <command>" every copy has written. The label and command are split at
+# box-hold's own date token, the one within 2 s of the file's mtime (a label may carry a timestamp of its own).
+# Only a missing record is written, through a temp file and a no-overwrite link, so it is idempotent and atomic.
+# Runs at every submission, every ~60 s in each waiter's loop, and by hand as `box-hold seed`.
+seed_ages() {
+    _A=$D/box-ages _Q=$D/queue
+    (umask 000; mkdir -p "$_A") 2>/dev/null; chmod 1777 "$_A" 2>/dev/null
+    for _f in $(ls "$_Q" 2>/dev/null); do
+        case $_f in 0-*) continue ;; esac
+        _p=${_f#*.}; _p=${_p%%.*}; [ -d "/proc/$_p" ] || continue
+        _n=${_f%%.*}; _n=${_n#1-}; _n=$(printf '%s' "$_n" | sed 's/^0*//'); [ -n "$_n" ] || continue
+        _l=$(head -1 "$_Q/$_f" 2>/dev/null) && _mt=$(stat -c %Y "$_Q/$_f" 2>/dev/null) || continue
+        _w="" _c=""
+        for _d in 0 1 2 -1 -2; do
+            _t=$(date -u -d "@$((_mt - _d))" +%FT%TZ 2>/dev/null) || continue
+            case "$_l" in *" $_t "*) _w=${_l%%" $_t "*}; _c=${_l#*" $_t "}; break ;; esac
+        done
+        [ -n "$_w" ] || continue
+        _k=$(printf '%s\0%s' "$_w" "$_c" | sha256sum | cut -c1-32)
+        [ -e "$_A/$_k" ] && continue
+        (umask 000; printf '%s\n' "$_n" > "$_A/.$_k.$$" && ln "$_A/.$_k.$$" "$_A/$_k"; rm -f "$_A/.$_k.$$") 2>/dev/null
+    done
+}
+if [ "${1:-}" = seed ]; then seed_ages; exit 0; fi
+dev=${1:?usage: box-hold <gpu|npu|both> <command...> | box-hold seed}; shift
 [ $# -gt 0 ] || { echo "box-hold: no command" >&2; exit 2; }
 # 2026-11-23 orchestrator: GPU and NPU are never held by two different jobs at once (06:29Z hard reset, reset reason 0x00800800, GPU ticket + separate NPU ticket); every ticket takes both locks until that is understood.
 case $dev in gpu|npu|both) dev=both ;; *) echo "box-hold: gpu, npu or both" >&2; exit 2 ;; esac
@@ -128,6 +155,7 @@ fi
 #  - a lane ticket waits FOR EVER by default (BOX_HOLD_WAIT unset = 0); an explicit value still bounds it. CI and board
 #    tickets keep the 3600 s default (their callers set their own).
 AGES=$D/box-ages; agekey=""
+[ "$pfx" = 1- ] && seed_ages   # v5.1: old-copy tickets get their record before anything re-submits them
 if [ "$pfx" = 1- ]; then
     (umask 000; mkdir -p "$AGES") 2>/dev/null; chmod 1777 "$AGES" 2>/dev/null
     agekey=$(printf '%s\0%s' "${BOX_HOLD_WHO:-$(id -un)}" "$*" | sha256sum | cut -c1-32)
@@ -152,7 +180,9 @@ exec 8>$D/box-gpu.lock || { echo "box-hold: cannot open $D/box-gpu.lock" >&2; ex
 exec 9>"$D/box-npu.lock" || { echo "box-hold: cannot open $D/box-npu.lock" >&2; exit 3; }   # no 2>/dev/null here: on a bare exec it would silence stderr for the rest of the script
 # The head TRIES the locks (flock -n) and looks at the queue again between tries, instead of blocking in flock: a head
 # blocked in `flock -w` never sees a CI ticket that arrives behind it, so the CI class could not be served next.
+_si=0
 while :; do
+    _si=$((_si + 1)); [ $((_si % 30)) = 1 ] && seed_ages   # v5.1: keep seeding while waiting (~60 s)
     # Alternating classes (2026-11-27 orchestrator, fairness v3): CI and board tickets beat lane tickets, but never twice
     # in a row while a lane ticket waits - with every PR push queueing a CI or reviewer-window ticket, lanes slipped
     # backwards (cl-kernel's ticket went from 2nd to 36th). $D/box-last says which class the last granted ticket was:

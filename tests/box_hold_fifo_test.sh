@@ -44,6 +44,9 @@
 #  24. v5: a lane ticket whose wait ran out and is re-submitted (same label + command) keeps its ORIGINAL age: it runs
 #      before a lane ticket first queued after it; once it has run, the same job queued again is a new, young ticket
 #  25. v5: a lane ticket waits for ever by default (no BOX_HOLD_WAIT) and with BOX_HOLD_WAIT=0; a CI ticket keeps 3600
+#  26. v5.1: an OLDER copy's ticket file (no age record, no marker) gets its record seeded; when that waiter's wait runs
+#      out and the job is re-submitted (same label + command) it keeps its place: H OLD B, not H B OLD. `box-hold seed`
+#      seeds by hand, and seeding twice changes nothing
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -278,6 +281,25 @@ s=$(date +%s); sh "$BH" gpu sleep 3 & sleep 0.3
 [ "$rc1" = 0 ] && [ "$d" -ge 2 ] && ok "a lane ticket with no BOX_HOLD_WAIT waits it out (rc 0 after ${d}s)" || bad "no-expiry default: rc $rc1 after ${d}s"
 wait
 grep -q '\[ -n "\$w" \] || { \[ "\$pfx" = 1- \] && w=0 || w=3600; }' "$BH" && ok "defaults: lane 0 (no expiry), CI/board 3600" || bad "wait defaults not as specified"
+
+# 26. v5.1: an older copy's ticket gets its age record seeded, and its re-submission keeps its place
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"
+jo=$(job OLD 0.2)
+sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.3
+sleep 30 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
+of="$T/locks/queue/1-$(printf '%012d' 2).$old.$st"
+printf '%s %s %s\n' "cl-oldjob" "$(date -u +%FT%TZ)" "sh -c $jo" > "$of"          # what an older copy wrote: no marker
+BOX_HOLD_WHO="cl-other B" sh "$BH" gpu sh -c "$(job B 0.2)" & sleep 0.4                 # B queues after it (and seeds)
+okey=$(printf '%s\0%s' "cl-oldjob" "sh -c $jo" | sha256sum | cut -c1-32)   # the key v5 computes for this job
+v_seeded=$(cat "$T/locks/box-ages/$okey" 2> /dev/null)
+n_seeded=$(ls "$T/locks/box-ages" 2> /dev/null | wc -l)
+sh "$BH" seed; n_again=$(ls "$T/locks/box-ages" | wc -l)
+kill "$old" 2> /dev/null; wait "$old" 2> /dev/null; rm -f "$of"                        # its wait ran out: the waiter is gone
+BOX_HOLD_WHO="cl-oldjob" sh "$BH" gpu sh -c "$jo" & sleep 0.3                           # the lane re-submits the same job
+wait
+[ "$v_seeded" = 2 ] && [ "$n_again" = "$n_seeded" ] && ok "an older copy's ticket gets ITS age record (its key = 2, seeded at a submission; seeding again changes nothing)" \
+  || bad "seeding: record for the old ticket = [$v_seeded] (want 2); $n_seeded record(s), then $n_again"
+[ "$(tr '\n' ' ' < "$T/order")" = "H OLD B " ] && ok "its re-submission keeps its original place (H OLD B, not H B OLD)" || bad "seeded age: $(tr '\n' ' ' < "$T/order")"
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

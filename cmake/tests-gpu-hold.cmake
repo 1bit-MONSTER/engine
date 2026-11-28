@@ -145,3 +145,8 @@ add_test(NAME coder_llm_window COMMAND bash ${CMAKE_SOURCE_DIR}/tests/coder_llm_
 # bare flock let five later tickets overtake the coder-llm window in an hour). Stub jobs on a private BOX_HOLD_DIR:
 # arrival order with no overlap, a SIGKILLed waiter skipped, rc 4 behind a holder and while still queued, rc and .who.
 add_test(NAME box_hold_fifo COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_fifo_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)
+
+# box-hold v6 LANE RUNS (owner 2026-11-28: "give the box to ONE lane until its job is done"): the focus lane runs back
+# to back with no queued cap, keeps the focus within the grace, hands over after the grace or its budget, and CI runs
+# between its tickets; `box-hold focus` prints the state. Stub jobs on a private BOX_HOLD_DIR, no device.
+add_test(NAME box_hold_lanes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_lanes_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)

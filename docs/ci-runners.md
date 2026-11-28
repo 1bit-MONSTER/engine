@@ -542,6 +542,42 @@ waiter of an older box-hold copy takes the lock only when it sorts first, so pre
 nobody to take it. The stub test's last arm pins that the next CI ticket runs at once instead. Lane tickets queued
 before the change keep plain FIFO until they are queued again.
 
+**Lane runs (v6, owner 2026-11-28: "stop splitting GPU time between lanes - give the box to ONE lane until its job is
+done").** box-hold gives the GPU to one lane at a time:
+1. **Focus lane:** the lane owning the oldest waiting lane ticket. While it has tickets queued, only its tickets run,
+   back to back, in its own submission order.
+2. **No cap for the focus lane:** it may queue its whole job. Every other lane keeps the cap of 2 queued. A lane whose
+   ticket is running keeps the focus meanwhile.
+3. **Grace:** the focus lane keeps the focus while it re-submits within `BOX_HOLD_FOCUS_GRACE` (300 s) of its last
+   ticket ending, so a lane chaining steps is not cut off.
+4. **Hand-over:** the focus passes to the next-oldest lane when the focus lane has had nothing queued or running for
+   the grace, or after `BOX_HOLD_FOCUS_BUDGET` (6 h). After a budget, the lane goes to the back of the lane order until
+   every other waiting lane has had a turn, and its tickets keep their ages.
+5. **CI between, never during:** CI tickets (the runner account and GitHub Actions jobs: hw-gate, hrx-build, the
+   reviewer window) alternate with the focus lane's tickets, and never run during one. During the focus lane's grace,
+   only CI runs.
+6. **Timeouts:** a lane ticket runs under `timeout BOX_HOLD_LANE_MAX_S` (5400 s = 90 min; the 45-min fleet cap is
+   lifted for lane runs). A CI ticket keeps `BOX_HOLD_CI_MAX` (2700 s).
+7. **Board class folded in:** `BOX_HOLD_PRIORITY=board` now queues a cl-lb lane ticket and reports it. There is no
+   separate board priority while one lane has the box.
+8. **`box-hold focus`:** prints the focus lane, its budget, its remaining tickets, the lane order after it, and the
+   CI tickets waiting.
+
+**State:** `/tmp/box-locks/box-focus` (lane, since, last activity), `box-focus-done` (lanes that used their budget) and
+`box-running`, all under `box-focus.lock`, and all rewritten in place (the directory is sticky). One awk pass per poll
+reads the whole queue.
+
+**Coexistence with older waiters:** a v6 waiter acts on its own choice only when the chosen ticket carries the
+`box-hold-v6` marker. Otherwise it follows the v5 rule that older waiters compute, so no two waiters can each wait for
+the other. Waiters of older copies can still break a lane run until they drain.
+
+**v5.1, folded in:** every live lane ticket without an age record gets one seeded from its own file (its number, and
+its label and command split at box-hold's date token). Older copies wrote no record. Seeding runs at every submission,
+every ~60 s while waiting, and on `box-hold seed`.
+
+Tests: `tests/box_hold_lanes_test.sh` (ctest `box_hold_lanes`) has one arm per rule, and `box_hold_fifo` covers the
+rest.
+
 **A lane ticket keeps its place and never expires (v5, 2026-11-28).** The queue had grown longer than any wait: about
 37 tickets at about 35 minutes each is more than 12 hours. So lane tickets expired, re-queued at the back, and could
 starve for ever. Two rules fix that:

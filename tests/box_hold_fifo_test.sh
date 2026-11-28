@@ -27,10 +27,8 @@
 #  10. the command's stderr reaches the caller (a bare `exec 9>lock 2>/dev/null` used to discard every job's stderr)
 #  11. BOX_HOLD_PRIORITY=ci set by hand (no runner) is IGNORED: a lane ticket, and box-hold says so (stderr + box-hold.log)
 #  12. under a Runner.Worker but without GITHUB_ACTIONS=true: still a lane ticket
-#  13. board class (cl-lb label): after CI, ahead of lanes queued earlier
-#  14. board asked for by another label: a lane ticket, reported
-#  15. at most 2 board tickets queued: a third is a lane ticket (reported), served after the lanes ahead of it
-#  16. a board ticket's command has the same 45-min cap (rc 124)
+#  13. v6: the board class is folded into lane runs - BOX_HOLD_PRIORITY=board queues a LANE ticket (reported)
+#  14. (v6) a lane ticket's command is capped at BOX_HOLD_LANE_MAX_S (90 min on the box; rc 124)
 #  17. lane cap: 2 queued tickets of one lane -> a 3rd from that lane is refused AT ONCE (exit 4, "lane cap"), not queued
 #  18. a running ticket does not count: the lane's holder + 2 queued -> a 3rd is still queued
 #  19. lanes are separate: another lane, and a dashed lane name from BOX_HOLD_LANES (cl-inkling-npu vs cl-inkling)
@@ -50,7 +48,7 @@
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
-export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2
+export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1   # v6: a 1 s focus grace (300 s on the box) so lanes hand over fast
 unset GITHUB_ACTIONS   # this test runs under a real Runner.Worker in CI: only ci() below may look like CI
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 cp "$(command -v bash)" "$T/Runner.Worker"   # a process's comm is its executable's name: this is what box-hold looks for
@@ -64,7 +62,7 @@ job() { # <tag> <secs>: record start order, flag any overlap
 }
 
 # 1. order
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 for i in 1 2 3 4 5; do BOX_HOLD_WHO=w$i sh "$BH" both sh -c "$(job $i 0.3)" & sleep 0.3; done
 wait
@@ -73,7 +71,7 @@ wait
 [ -z "$(ls "$T/locks/queue")" ] && ok "queue empty afterwards" || bad "queue left: $(ls "$T/locks/queue")"
 
 # 2. killed waiter
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job B 0.2)" & b=$!; sleep 0.3
@@ -103,7 +101,7 @@ BOX_HOLD_WHO=lane-x sh "$BH" npu sh -c 'exit 5'; rc=$?
 grep -q "^lane-x " "$T/locks/box-gpu.who" && grep -q "^lane-x " "$T/locks/box-npu.who" && ok ".who files name the holder (both locks)" || bad "who: $(cat "$T"/locks/box-*.who)"
 
 # 6. CI jumps the line, FIFO among CI
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L2 0.2)" & sleep 0.3
@@ -114,7 +112,7 @@ wait
 [ ! -e "$T/overlap" ] && ok "never two jobs at once with CI in the queue" || bad "overlap seen"
 
 # 7. a dead CI waiter is skipped
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 ci gpu sh -c "$(job C1 0.2)" & c=$!; sleep 0.3
@@ -123,7 +121,7 @@ killtree "$c"; wait
 [ -z "$(ls "$T/locks/queue")" ] && ok "dead CI ticket swept" || bad "queue left: $(ls "$T/locks/queue")"
 
 # 8. previous-format tickets: after CI, before new lanes
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
 sleep 2.5 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/$(printf '%012d' 1).$old.$st"   # a live waiter of the old script
@@ -144,7 +142,7 @@ sh "$BH" gpu sh -c 'echo to-stderr >&2' 2> "$T/err10"
 grep -qx to-stderr "$T/err10" && ok "the command's stderr reaches the caller" || bad "stderr lost: [$(cat "$T/err10")]"
 
 # 11. the variable alone does not make a ticket CI
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_WHO=lane-z BOX_HOLD_PRIORITY=ci sh "$BH" gpu sh -c "$(job Z 0.2)" 2> "$T/err11" & sleep 0.3
@@ -154,43 +152,20 @@ grep -q "BOX_HOLD_PRIORITY=ci ignored for lane-z" "$T/err11" && grep -q "ignored
   && ok "the ignored request is reported on stderr and in box-hold.log" || bad "no report: [$(cat "$T/err11")]"
 
 # 12. a Runner.Worker ancestor without GITHUB_ACTIONS=true is not CI
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=ci "$T/Runner.Worker" -c 'sh "$0" "$@"; exit $?' "$BH" gpu sh -c "$(job W 0.2)" 2> /dev/null & sleep 0.3
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H L1 W " ] && ok "Runner.Worker without GITHUB_ACTIONS=true: a lane" || bad "worker-only order: $(tr '\n' ' ' < "$T/order")"
 
-# 13. board: after CI, before lanes
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
-sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
-sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
-BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-q38 sh "$BH" gpu sh -c "$(job B1 0.2)" & sleep 0.3
-ci gpu sh -c "$(job C1 0.2)" & sleep 0.3
-wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 B1 " ] && ok "board (cl-lb): after CI; with alternation the waiting lane goes between them" || bad "board order: $(tr '\n' ' ' < "$T/order")"
-
-# 14. board for another label
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
-sh "$BH" gpu sh -c "$(job H 1.2)" & sleep 0.3
-sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
-BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-hf-sweep sh "$BH" gpu sh -c "$(job X 0.2)" 2> "$T/err14" & sleep 0.3
-wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H L1 X " ] && grep -q "for the cl-lb label only" "$T/err14" \
-  && ok "board for another label: a lane ticket, reported" || bad "board by another label: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err14")]"
-
-# 15. the board quota
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
-sh "$BH" gpu sh -c "$(job H 1.8)" & sleep 0.3
-sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
-for b in B1 B2 B3; do BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sh -c "$(job $b 0.2)" 2>> "$T/err15" & sleep 0.3; done
-wait
-[ "$(tr '\n' ' ' < "$T/order")" = "H B1 L1 B2 B3 " ] && grep -q "already has 2 ticket(s) queued" "$T/err15" \
-  && ok "at most 2 board tickets queued: the third is a lane, reported" || bad "board quota: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err15")]"
-
-# 16. board cap
-s=$(date +%s); BOX_HOLD_CI_MAX=1 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sleep 5; rc=$?; d=$(( $(date +%s) - s ))
-[ "$rc" = 124 ] && [ "$d" -le 3 ] && ok "a board ticket's command is capped (rc 124 after ${d}s)" || bad "board cap: rc $rc after ${d}s"
+# 13. v6: board is a lane ticket now
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
+BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-q38 sh "$BH" gpu sh -c "$(job B1 0.2)" 2> "$T/err13"; rc=$?
+[ "$rc" = 0 ] && grep -q "folded into lane runs" "$T/err13" && [ "$(cat "$T/order")" = B1 ] && ok "board asks queue a lane ticket (folded into lane runs, reported)" || bad "board fold: rc $rc [$(cat "$T/err13")]"
+# 14. v6: a lane ticket's command is capped
+s=$(date +%s); BOX_HOLD_LANE_MAX_S=1 BOX_HOLD_WHO=cl-cap sh "$BH" gpu sleep 5; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 124 ] && [ "$d" -le 3 ] && ok "a lane ticket's command is capped at BOX_HOLD_LANE_MAX_S (rc 124 after ${d}s)" || bad "lane cap timeout: rc $rc after ${d}s"
 
 # 17-20: the lane cap
 printf 'cl-inkling-npu\n' > "$T/lanes"; export BOX_HOLD_LANES=$T/lanes
@@ -208,12 +183,12 @@ sleep 0.4
 for f in "$T"/locks/queue/*; do cat "$f"; done 2> /dev/null | grep -q '^cl-inkling-npu x' && grep -q '^cl-hf y' $(ls "$T"/locks/queue/* 2> /dev/null) /dev/null \
   && ok "other lanes queue normally, incl. a dashed lane name (cl-inkling-npu is not cl-inkling)" || bad "other lanes: [$(cat "$T/err19a" "$T/err19b")]"
 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-z sh "$BH" gpu true & sleep 0.3
-for i in 1 2 3 4; do BOX_HOLD_WHO="coder-llm" sh "$BH" gpu true & done; sleep 0.4
+for i in 1 2 3 4; do BOX_HOLD_WHO="coder-llm" sh "$BH" gpu true & done; sleep 1.2   # v6: submissions are serialised by the sequence lock
 [ "$(grep -l '^coder-llm' "$T"/locks/queue/* 2> /dev/null | wc -l)" = 4 ] && ok "a label of no cl-/pi- lane is not capped (4 queued)" || bad "coder-llm capped: $(grep -l '^coder-llm' "$T"/locks/queue/* 2> /dev/null | wc -l)"
-ls "$T/locks/queue" | grep -q '^0-b-' && ok "a board ticket is not counted or capped" || bad "board ticket missing"
+ls "$T/locks/queue" | grep -q '^1-' && ok "(v6) a board request is a lane ticket" || bad "no lane ticket from the board request"
 wait
 # 18. the running ticket does not count
-: > "$T/errq"
+: > "$T/errq"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"; sleep 1.2   # no focus left from arm 20
 BOX_HOLD_WHO="cl-inkling run" sh "$BH" gpu sleep 2 & sleep 0.3
 q "cl-inkling a"
 BOX_HOLD_WHO="cl-inkling c" sh "$BH" gpu true 2> "$T/err18"; rc=$?
@@ -222,21 +197,21 @@ wait
 unset BOX_HOLD_LANES
 
 # 21. alternation: a stream of CI tickets does not starve the lanes
-rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.3
 for l in L1 L2 L3; do sh "$BH" gpu sh -c "$(job $l 0.2)" & sleep 0.2; done
 for c in C1 C2 C3 C4; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 C2 L2 C3 L3 C4 " ] && ok "a stream of CI tickets: lanes progress every other turn (H C1 L1 C2 L2 C3 L3 C4)" || bad "alternation: $(tr '\n' ' ' < "$T/order")"
 [ ! -e "$T/overlap" ] && ok "  ... never two jobs at once" || bad "overlap seen"
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
 for c in C1 C2 C3; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 C3 " ] && ok "no lane waiting: CI tickets run back to back" || bad "CI only: $(tr '\n' ' ' < "$T/order")"
 
 # 22. no stall on an older copy's lane waiter
-rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 ci gpu sh -c "$(job C0 1)" & sleep 0.3
 sleep 6 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 2).$old.$st"   # live, no marker line
@@ -249,7 +224,7 @@ kill "$old" 2> /dev/null; wait 2> /dev/null
 # 23. lane FIFO across the copies (review cl-release on #3586): a MARKED lane ticket must not overtake an OLDER
 #     unmarked one (a waiter of a pre-v3 copy) after a priority turn; while the old one waits, the turn goes by the class
 #     order (here: CI), and the marked lane runs only once the older lane ticket is gone
-rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 ci gpu sh -c "$(job C0 1)" & sleep 0.3
 sleep 3 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 3).$old.$st"   # live, no marker, oldest lane
@@ -269,7 +244,7 @@ BOX_HOLD_WHO="cl-age A" sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3           
 wait
 [ "$rcA" = 4 ] && [ "$(tr '\n' ' ' < "$T/order")" = "H A B " ] && ok "a re-submitted lane ticket keeps its original age (H A B, not H B A)" \
   || bad "original age: first rc $rcA, order $(tr '\n' ' ' < "$T/order")"
-: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 BOX_HOLD_WHO="cl-other C" sh "$BH" gpu sh -c "$(job C 0.2)" & sleep 0.3
 BOX_HOLD_WHO="cl-age A" sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3                      # A ran: no old age left
@@ -283,7 +258,7 @@ wait
 grep -q '\[ -n "\$w" \] || { \[ "\$pfx" = 1- \] && w=0 || w=3600; }' "$BH" && ok "defaults: lane 0 (no expiry), CI/board 3600" || bad "wait defaults not as specified"
 
 # 26. v5.1: an older copy's ticket gets its age record seeded, and its re-submission keeps its place
-rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 jo=$(job OLD 0.2)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.3
 sleep 30 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)

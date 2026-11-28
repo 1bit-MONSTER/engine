@@ -28,6 +28,8 @@
 #   9. a lane whose queued tickets all have OLDER-copy waiters (no box-hold-v6 marker) is idle to v6: the next lane runs
 #      (2026-11-28 05:10Z: such a focus lane left the box idle 36 min)
 #  10. a holder SIGKILLed during its command does not pin the focus: the next lane runs after the grace (review cl-flm)
+#  11. at the deadline, a leftover the command forked (it inherited the lock descriptors) is reaped, so the next ticket
+#      runs at once; a leftover at a normal end is logged, not killed (review cl-flm)
 set -uo pipefail
 BH=${1:?usage: box_hold_lanes_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -76,12 +78,12 @@ L cl-b B1 & wait; d=$(( $(date +%s) - s ))
 grep -q "focus: cl-a has had nothing queued" "$T/locks/box-hold.log" && ok "  ... and the hand-over is logged" || bad "no hand-over line"
 
 # 5. the budget
-reset; export BOX_HOLD_FOCUS_BUDGET=2
-L cl-a A1 0.9 & sleep 0.2
-L cl-a A2 0.9 & sleep 0.1; L cl-a A3 0.9 & sleep 0.1; L cl-b B1 0.3 & sleep 0.1
+reset; export BOX_HOLD_FOCUS_BUDGET=4
+L cl-a A1 2.5 & sleep 0.2   # 2.5 s each against a 4 s budget (whole seconds): A1 ends inside it, A2 past it -> B1, then A3
+L cl-a A2 2.5 & sleep 0.1; L cl-a A3 0.3 & sleep 0.1; L cl-b B1 0.3 & sleep 0.1
 wait
 [ "$(order)" = "A1 A2 B1 A3 " ] && ok "after its budget the focus lane goes to the back: A1 A2 B1 A3 (A3 keeps its place in A's order)" || bad "budget: $(order)"
-grep -q "focus: cl-a used its 2s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
+grep -q "focus: cl-a used its 4s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
 unset BOX_HOLD_FOCUS_BUDGET
 
 # 6. CI between the focus lane's tickets
@@ -127,6 +129,18 @@ BOX_HOLD_WHO=cl-aaa sh "$BH" both sh -c 'sleep 2' & pk=$!; sleep 0.6
 kill -9 "$pk"; wait "$pk" 2> /dev/null; sleep 2   # its command ends on its own
 s=$(date +%s); timeout 10 env BOX_HOLD_WHO=cl-bbb sh "$BH" both sh -c "$(job B-RAN 0.1)"; rc=$?; d=$(( $(date +%s) - s ))
 [ "$rc" = 0 ] && [ "$(order)" = "B-RAN " ] && ok "a SIGKILLed holder does not pin the focus: the next lane ran (${d}s)" || bad "stale running: rc $rc $(order) [$(cat "$T/locks/box-running")]"
+
+# 11. leftovers
+reset; : > "$T/locks/box-hold.log"
+s=$(date +%s); BOX_HOLD_LANE_MAX_S=1 BOX_HOLD_REAP_GRACE_S=1 BOX_HOLD_WHO=cl-fork sh "$BH" gpu sh -c 'setsid sleep 30 & sleep 30' & pf=$!   # setsid: out of timeout's process group, as a daemonizing server is
+sleep 0.4; timeout 20 env BOX_HOLD_WHO=cl-next sh "$BH" gpu sh -c "$(job N 0.1)" & pn=$!   # a waiter meanwhile: its sleep holds the fds too
+wait "$pf"; rc=$?; wait "$pn"; rc2=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 124 ] && [ "$rc2" = 0 ] && [ "$d" -le 12 ] && grep -q "cl-fork: deadline: 1 leftover" "$T/locks/box-hold.log" \
+  && ok "at the deadline only the forked leftover is reaped (not the waiter's children): the next ticket ran (${d}s), logged" || bad "deadline reap: rc $rc/$rc2 ${d}s [$(tail -2 "$T/locks/box-hold.log")]"
+reset; : > "$T/locks/box-hold.log"
+BOX_HOLD_WHO=cl-bg sh "$BH" gpu sh -c 'setsid sleep 1.5 & sleep 0.2; exit 0'; rc=$?
+grep -q "cl-bg: ended with 1 leftover" "$T/locks/box-hold.log" && ok "a leftover at a normal end is logged (left running)" || bad "normal-end leftover: rc $rc [$(cat "$T/locks/box-hold.log")]"
+sleep 1.6
 
 [ "$fail" = 0 ] && echo "box_hold_lanes: PASS" || echo "box_hold_lanes: FAIL"
 exit "$fail"

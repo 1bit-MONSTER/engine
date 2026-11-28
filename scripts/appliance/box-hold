@@ -320,5 +320,38 @@ else
     timeout -k 30 "${BOX_HOLD_LANE_MAX_S:-5400}" "$@"   # a lane run's ticket: at most 90 min (crash safety; v6 lifts the 45-min cap)
 fi
 rc=$?
+# Leftovers (review cl-flm on #3600): `timeout` signals only the process it started, so a server the command forked keeps
+# the inherited lock descriptors (8/9) and the box stays locked after the ticket ends. Any process other than this one
+# and the queue's waiters (they hold the files open to poll) that still has a lock file open is this ticket's leftover:
+# logged at a normal end; at the deadline (rc 124) sent TERM, then KILL. Processes of another uid (sudo) cannot be
+# read or signalled here; the log says so when the lock stays held.
+leftovers() {   # one find over the fd links (by name), then an inode check of each candidate: a full /proc walk took ~1-2 s on the box
+    _w=$(ls "$Q" 2>/dev/null | sed -n 's/^[^.]*\.\([0-9]*\)\..*/\1/p')
+    _b=${D##*/}
+    find /proc/[0-9]*/fd -maxdepth 1 \( -lname "*/$_b/box-gpu.lock" -o -lname "*/$_b/box-npu.lock" \) 2>/dev/null |
+    while read -r _fd; do
+        [ "$_fd" -ef "$D/box-gpu.lock" ] || [ "$_fd" -ef "$D/box-npu.lock" ] || continue
+        _pid=${_fd#/proc/}; _pid=${_pid%%/*}
+        # a waiter's own children (its `sleep`, its scan subshells) inherit the descriptors too: anything below a waiter or
+        # below this box-hold is not a leftover (a leftover has been re-parented away from us; measured on the box: 17
+        # waiters' `sleep 2`)
+        _a=$_pid _n=0 _skip=0
+        while [ -n "$_a" ] && [ "$_a" -gt 1 ] && [ $_n -lt 12 ]; do
+            if [ "$_a" = $$ ] || printf '%s\n' "$_w" | grep -qx "$_a"; then _skip=1; break; fi
+            _a=$(sed 's/.*) //' "/proc/$_a/stat" 2>/dev/null | cut -d' ' -f2); _n=$((_n + 1))
+        done
+        [ $_skip = 1 ] || echo "$_pid"
+    done | sort -u
+}
+_left=$(exec 8>&- 9>&-; leftovers)   # the subshell inherits 8/9: closed, so it does not count itself
+if [ -n "$_left" ]; then
+    if [ "$rc" = 124 ]; then
+        focus_log "${BOX_HOLD_WHO}: deadline: $(echo $_left | wc -w) leftover process(es) hold the box lock: TERM, then KILL:" $_left
+        kill -TERM $_left 2>/dev/null; sleep "${BOX_HOLD_REAP_GRACE_S:-5}"
+        _left=$(exec 8>&- 9>&-; leftovers); [ -n "$_left" ] && kill -KILL $_left 2>/dev/null
+    else
+        focus_log "${BOX_HOLD_WHO}: ended with $(echo $_left | wc -w) leftover process(es) holding the box lock (left running):" $_left
+    fi
+fi
 if [ "$pfx" = 1- ]; then : > "$D/box-running" 2>/dev/null; touch_focus "$mylane"; fi   # its grace starts now (truncate: another user may own the file)
 exit $rc

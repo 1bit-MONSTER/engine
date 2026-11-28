@@ -23,7 +23,9 @@
 #   4. a 'both' ticket starts only when both devices are free, and blocks new starts on both while it waits
 #   5. the switch is read at every poll: a gpu waiter queued while it was off takes only the GPU once it is on
 #   6. `box-hold focus` prints both devices' lane runs when split
-#   7. with the switch off, `box-hold focus` counts the pre-v7 waiters (when to switch on)
+#   7. with the switch off, `box-hold focus` counts the pre-v7.1 waiters
+#   8. v7.1 (2026-11-28 09:20Z): with the switch on but an older copy's waiter live, the split is NOT active (every ticket
+#      takes both locks: one scheduler, the one older waiters follow); it starts by itself once the older waiter is gone
 set -uo pipefail
 BH=${1:?usage: box_hold_split_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -96,8 +98,21 @@ reset; rm -f "$T/split"; mkdir -p "$T/locks/queue"
 sleep 30 & p1=$!; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
 printf 'cl-old %s x\nbox-hold-v3\nbox-hold-v6\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 7).$p1.$s1"
 out=$(sh "$BH" focus)
-echo "$out" | grep -q "^pre-v7 waiters (switch the split on when this is 0.*: 1$" && ok "switch off: box-hold focus counts the pre-v7 waiters (1)" || bad "pre-v7 count: $out"
+echo "$out" | grep -q "^pre-v7.1 waiters (the split starts only when this is 0): 1$" && ok "switch off: box-hold focus counts the pre-v7.1 waiters (1)" || bad "pre-v7.1 count: $out"
 kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null
+
+# 8. the split waits for older waiters
+reset; touch "$T/split"; mkdir -p "$T/locks/queue"
+sleep 30 & p1=$!; sleep 0.2; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
+printf 'cl-old %s x\nbox-hold-v3\nbox-hold-v6\nbox-hold-v7\ndev=gpu\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 999999).$p1.$s1"   # a v7 (pre-7.1) waiter (a stub: it never takes its turn)
+echo "cl-a $(date +%s) $(date +%s)" > "$T/locks/box-focus"   # cl-a has the (one-scheduler) focus, so the stub is not waited for
+out=$(sh "$BH" focus)
+echo "$out" | grep -q "^split devices: REQUESTED .* 1 older-copy waiter" && ok "switch on + an older waiter: focus says the split is requested, not active" || bad "requested print: $out"
+L cl-a gpu G 0.3 npu
+grep -q "held npu G" "$T/probe" && ok "  ... and a gpu ticket takes both locks meanwhile (one scheduler)" || bad "split active beside an older waiter: $(cat "$T/probe") [queue: $(ls "$T/locks/queue" | tr '\n' ' ')]"
+kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null; : > "$T/probe"
+L cl-a gpu G2 0.3 npu
+grep -q "free npu G2" "$T/probe" && ok "  ... once it is gone the split starts by itself (gpu ticket: GPU lock only)" || bad "split did not start: $(cat "$T/probe")"
 
 [ "$fail" = 0 ] && echo "box_hold_split: PASS" || echo "box_hold_split: FAIL"
 exit "$fail"

@@ -445,6 +445,7 @@ and `coder-llm-ticketed` describes the old dev box. On the appliance, the PR rev
 
 | piece | where | started by |
 |---|---|---|
+| runner `strixhalo-bench` (the hw-gate / hrx-build jobs), user `bcloud` | `/home/bcloud/actions-runner`, `HOME=/home/bcloud` set explicitly (from init it inherited the boot `HOME=/` and every job failed in "Prepare the appliance runner", 2026-11-28) | `/etc/init.d/50github-runner` ([source](../scripts/appliance/50github-runner)) |
 | runner `strixhalo-pr-agent`, labels `pr-agent,issue-agent` | `/var/lib/ghrunner/actions-runner-pr-agent`, user `ghrunner` (no shell, home `/var/lib/ghrunner`) | `/etc/init.d/52github-runner-pr-agent` ([source](../scripts/appliance/52github-runner-pr-agent)) |
 | the window watcher and its server, as `ghrunner` (in `render`/`video` for the GPU, so box-hold serves its tickets in the CI class; it was the owner's account until 2026-11-27) | `/usr/local/bin/coder-llm-window` ([source](../scripts/appliance/coder-llm-window)), root-owned so a job cannot rewrite it | `/etc/init.d/51coder-llm-window` ([source](../scripts/appliance/51coder-llm-window)) |
 | the model | `/data/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf` (sha256 `2841aa31…2533`) | — |

@@ -87,6 +87,15 @@ check "--embed needs serve (exit $rc)" '[ "$rc" = 5 ] && [ ! -s "$scratch/out" ]
 
 # strict placement on HRX (docs/serve.md, "Off-HRX placement: strict by default")
 env_of() { printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['env'].get('$1', '-'))"; }
+
+# engine#3590: --device cpu asks llama.cpp for no GPU device and keeps the HRX runtime from starting (it opened /dev/kfd)
+out=$(env -u GGML_HRX_DISABLE "$bin" serve -m "$scratch/small.gguf" --device cpu --llama-server "$here/fake_backend.py" --port 43121 --print-backend 2>"$scratch/err"); rc=$?
+check "cpu plan: --device none and GGML_HRX_DISABLE=1 (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(get "d[\"argv\"][d[\"argv\"].index(\"--device\")+1]")" = none ] && [ "$(env_of GGML_HRX_DISABLE)" = 1 ]'
+out=$(GGML_HRX_DISABLE=0 "$bin" serve -m "$scratch/small.gguf" --device cpu --llama-server "$here/fake_backend.py" --port 43122 --print-backend 2>"$scratch/err"); rc=$?
+check "cpu plan: a GGML_HRX_DISABLE the caller set wins (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = - ]'
+out=$(env -u GGML_HRX_DISABLE -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --port 43123 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: no GGML_HRX_DISABLE (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_DISABLE)" = - ]'
 out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \
       --llama-server "$here/fake_backend.py" --no-mem-check --port 43122 --print-backend 2>"$scratch/err"); rc=$?
 check "hrx plan: strict by default (exit $rc, GGML_HRX_STRICT=$(env_of GGML_HRX_STRICT))" \

@@ -24,6 +24,8 @@
 #      cl-inkling-npu with cl-inkling's issue (exact lane match, review cl-loomfun)
 #   5. release tickets never expire by default; focus prints them
 #   6. split devices on: an npu release ticket goes before the npu lane's queued ticket, while the GPU keeps its own run
+#   7. a focus-lane waiter of a copy OLDER than the release class (it reads 0-r- tickets as CI) does not jump the release
+#      tickets either: A1 R1 R2 A2, not A1 R1 A2 R2 (2026-11-28 18:09:31Z, cl-220)
 set -uo pipefail
 BH=${1:?usage: box_hold_release_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -87,6 +89,17 @@ wait
 o=$(awk '$1 ~ /^(N|RN)/ { printf "%s ", $1 }' "$T/order")
 [ "$o" = "N1 RN N2 " ] && grep -q G1 "$T/order" && ok "split: the npu release ticket went before the npu lane's N2 ($o), the GPU ran its own lane" || bad "split release: $(order)"
 export BOX_HOLD_SPLIT_FILE=$T/no-split
+
+# 7. an older copy's focus-lane waiter
+reset
+# the older copy: this box-hold without the release kind (as v7.1: a 0-r- ticket is "ci" to it, no release-first rule)
+sed -e 's|kind = (f ~ /^0-r-/) ? "rel" : |kind = |' "$BH" > "$T/bh-old"
+grep -q '"rel"' "$T/bh-old" && grep -q 'kind = (f ~ /^0-r-/)' "$T/bh-old" && bad "could not derive the older copy"
+L cl-a A1 1 & sleep 0.3                                                        # cl-a has the focus; A1 runs
+BOX_HOLD_WHO=cl-a sh "$T/bh-old" gpu sh -c "$(job A2 0.2)" 2>> "$T/err" & sleep 0.2    # its next ticket, by the OLDER copy
+REL "cl-hrxtest #3580 r1" R1 0.6 & sleep 0.15; REL "cl-loom #3521 r2" R2 0.2 & sleep 0.15
+wait
+[ "$(order)" = "A1 R1 R2 A2 " ] && ok "an older copy's focus-lane waiter waits for every release ticket: $(order)" || bad "older copy jumped the release queue: $(order)"
 
 [ "$fail" = 0 ] && echo "box_hold_release: PASS" || echo "box_hold_release: FAIL"
 exit "$fail"

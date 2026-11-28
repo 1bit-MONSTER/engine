@@ -16,7 +16,7 @@
 #
 # box-hold <gpu|npu|both> <command...>  - run a device job with the box's one GPU and/or NPU held exclusively.
 # Agents on ryzen run every hardware job through this (ssh strixhalo box-hold gpu ...), so two lanes never share a
-# device. Waits for the lock; BOX_HOLD_WAIT=<seconds> bounds the wait (default 3600). Holder and start time in
+# device. Waits for the lock; BOX_HOLD_WAIT=<seconds> bounds the wait (lane tickets: none by default, CI/board 3600). Holder and start time in
 # $D/box-<dev>.who.
 # 2026-11-27 (cl-pragent, orchestrator-approved): waiters are served IN ORDER. A bare flock is not a FIFO: the
 # coder-llm window waited 05:54->06:54Z and lost the lock to five later tickets. Each waiter takes a number
@@ -40,7 +40,6 @@ dev=${1:?usage: box-hold <gpu|npu|both> <command...>}; shift
 [ $# -gt 0 ] || { echo "box-hold: no command" >&2; exit 2; }
 # 2026-11-23 orchestrator: GPU and NPU are never held by two different jobs at once (06:29Z hard reset, reset reason 0x00800800, GPU ticket + separate NPU ticket); every ticket takes both locks until that is understood.
 case $dev in gpu|npu|both) dev=both ;; *) echo "box-hold: gpu, npu or both" >&2; exit 2 ;; esac
-w=${BOX_HOLD_WAIT:-3600}
 poll=${BOX_HOLD_POLL:-2}
 Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
 (umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log $D/box-last) 2>/dev/null
@@ -85,7 +84,7 @@ if [ "$pfx" = 0-b- ]; then
         pfx=1- cap=0; ignored "the board class already has $_nb ticket(s) queued, the most it takes"
     fi
 fi
-# Lane cap (2026-11-27 orchestrator; cl-inkling had 19 queued): at most BOX_HOLD_LANE_MAX (3) QUEUED lane tickets per
+# Lane cap (2026-11-27 orchestrator; cl-inkling had 19 queued): at most BOX_HOLD_LANE_MAX (2; 3 until 11-28) QUEUED lane tickets per
 # lane; running tickets do not count (theirs has left the queue), nor do CI and board tickets. A further waiter from the
 # same lane is refused at once (exit 4). The lane is the label's first word when it starts cl- or pi-: its first two
 # dash tokens (cl-inkling-xyz -> cl-inkling), or the longest name in $BOX_HOLD_LANES (one per line) it starts with, for
@@ -112,14 +111,35 @@ if [ "$pfx" = 1- ]; then
             alive "$f" || continue
             [ "$(lane_of "$(head -c 300 "$Q/$f" 2>/dev/null)")" = "$_lane" ] && _nq=$((_nq + 1))
         done
-        if [ "$_nq" -ge "${BOX_HOLD_LANE_MAX:-3}" ]; then
+        if [ "$_nq" -ge "${BOX_HOLD_LANE_MAX:-2}" ]; then
             flock -u 7
-            _m="box-hold: lane cap: $_nq queued for $_lane (at most ${BOX_HOLD_LANE_MAX:-3} per lane): ${BOX_HOLD_WHO} refused, not queued"
+            _m="box-hold: lane cap: $_nq queued for $_lane (at most ${BOX_HOLD_LANE_MAX:-2} per lane): ${BOX_HOLD_WHO} refused, not queued"
             echo "$_m" >&2; echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
             exit 4
         fi
     fi
 fi
+# box-hold v5 (2026-11-28 orchestrator: ~37 tickets x ~35 min is longer than any wait, so expired lane tickets went to
+# the back and could starve for ever):
+#  - a LANE ticket keeps its ORIGINAL queue age across re-submissions: the first submission of a label + command records
+#    its number in $D/box-ages/<sha256 of label NUL command>; a later submission of the same job (its wait ran out, its
+#    waiter died) takes that number again, so it sorts where it first queued. The record goes when the ticket is
+#    granted, and a record older than BOX_HOLD_AGE_TTL (48 h) is dropped;
+#  - a lane ticket waits FOR EVER by default (BOX_HOLD_WAIT unset = 0); an explicit value still bounds it. CI and board
+#    tickets keep the 3600 s default (their callers set their own).
+AGES=$D/box-ages; agekey=""
+if [ "$pfx" = 1- ]; then
+    (umask 000; mkdir -p "$AGES") 2>/dev/null; chmod 1777 "$AGES" 2>/dev/null
+    agekey=$(printf '%s\0%s' "${BOX_HOLD_WHO:-$(id -un)}" "$*" | sha256sum | cut -c1-32)
+    find "$AGES" -type f -mmin +$(( ${BOX_HOLD_AGE_TTL:-172800} / 60 )) -delete 2>/dev/null
+    if _n0=$(cat "$AGES/$agekey" 2>/dev/null) && [ -n "$_n0" ] && [ "$_n0" -lt "$n" ] 2>/dev/null; then
+        n=$_n0   # re-submitted: back to its first place in the lane order
+    else
+        (umask 000; echo "$n" > "$AGES/$agekey") 2>/dev/null
+    fi
+fi
+w=${BOX_HOLD_WAIT-}
+[ -n "$w" ] || { [ "$pfx" = 1- ] && w=0 || w=3600; }
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 # the second line marks a waiter that knows the alternation rule: only such a lane ticket is preferred after a priority
 # turn (a waiter of an older box-hold copy waits for whatever sorts first, and preferring it would stall the queue)
@@ -160,7 +180,7 @@ while :; do
             flock -u 8   # the NPU lock is still held: give the GPU lock back and try again with the queue re-read
         fi
     fi
-    if [ $(( $(date +%s) - t0 )) -ge "$w" ]; then
+    if [ "$w" -gt 0 ] && [ $(( $(date +%s) - t0 )) -ge "$w" ]; then   # 0 = no expiry
         if [ "$head" = "$me" ]; then
             echo "box-hold: gpu busy: $(cat $D/box-gpu.who 2>/dev/null)" >&2
         else
@@ -172,6 +192,7 @@ while :; do
 done
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/dev/null
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
+[ -n "$agekey" ] && rm -f "$AGES/$agekey" 2>/dev/null   # granted: this job's original age is used up
 case $me in 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last" 2>/dev/null   # the class of this turn (alternation)
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP

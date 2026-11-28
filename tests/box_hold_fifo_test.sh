@@ -31,7 +31,7 @@
 #  14. board asked for by another label: a lane ticket, reported
 #  15. at most 2 board tickets queued: a third is a lane ticket (reported), served after the lanes ahead of it
 #  16. a board ticket's command has the same 45-min cap (rc 124)
-#  17. lane cap: 3 queued tickets of one lane -> a 4th from that lane is refused AT ONCE (exit 4, "lane cap"), not queued
+#  17. lane cap: 2 queued tickets of one lane -> a 3rd from that lane is refused AT ONCE (exit 4, "lane cap"), not queued
 #  18. a running ticket does not count: the lane's holder + 2 queued -> a 3rd is still queued
 #  19. lanes are separate: another lane, and a dashed lane name from BOX_HOLD_LANES (cl-inkling-npu vs cl-inkling)
 #  20. CI and board tickets are not counted or capped; a label of no cl-/pi- lane is not capped
@@ -41,6 +41,9 @@
 #  22. an older copy's lane waiter (its ticket has no box-hold-v3 marker) is NOT preferred after a priority turn: the
 #      next CI ticket runs at once instead of the queue stalling on a waiter that never takes the lock (21:57Z 11-27)
 #  23. ... and a younger MARKED lane ticket does not overtake that older unmarked one (lane FIFO across the copies)
+#  24. v5: a lane ticket whose wait ran out and is re-submitted (same label + command) keeps its ORIGINAL age: it runs
+#      before a lane ticket first queued after it; once it has run, the same job queued again is a new, young ticket
+#  25. v5: a lane ticket waits for ever by default (no BOX_HOLD_WAIT) and with BOX_HOLD_WAIT=0; a CI ticket keeps 3600
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
@@ -58,7 +61,7 @@ job() { # <tag> <secs>: record start order, flag any overlap
 }
 
 # 1. order
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 for i in 1 2 3 4 5; do BOX_HOLD_WHO=w$i sh "$BH" both sh -c "$(job $i 0.3)" & sleep 0.3; done
 wait
@@ -67,7 +70,7 @@ wait
 [ -z "$(ls "$T/locks/queue")" ] && ok "queue empty afterwards" || bad "queue left: $(ls "$T/locks/queue")"
 
 # 2. killed waiter
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job B 0.2)" & b=$!; sleep 0.3
@@ -97,7 +100,7 @@ BOX_HOLD_WHO=lane-x sh "$BH" npu sh -c 'exit 5'; rc=$?
 grep -q "^lane-x " "$T/locks/box-gpu.who" && grep -q "^lane-x " "$T/locks/box-npu.who" && ok ".who files name the holder (both locks)" || bad "who: $(cat "$T"/locks/box-*.who)"
 
 # 6. CI jumps the line, FIFO among CI
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L2 0.2)" & sleep 0.3
@@ -108,7 +111,7 @@ wait
 [ ! -e "$T/overlap" ] && ok "never two jobs at once with CI in the queue" || bad "overlap seen"
 
 # 7. a dead CI waiter is skipped
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.5
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 ci gpu sh -c "$(job C1 0.2)" & c=$!; sleep 0.3
@@ -117,7 +120,7 @@ killtree "$c"; wait
 [ -z "$(ls "$T/locks/queue")" ] && ok "dead CI ticket swept" || bad "queue left: $(ls "$T/locks/queue")"
 
 # 8. previous-format tickets: after CI, before new lanes
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
 sleep 2.5 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/$(printf '%012d' 1).$old.$st"   # a live waiter of the old script
@@ -138,7 +141,7 @@ sh "$BH" gpu sh -c 'echo to-stderr >&2' 2> "$T/err10"
 grep -qx to-stderr "$T/err10" && ok "the command's stderr reaches the caller" || bad "stderr lost: [$(cat "$T/err10")]"
 
 # 11. the variable alone does not make a ticket CI
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_WHO=lane-z BOX_HOLD_PRIORITY=ci sh "$BH" gpu sh -c "$(job Z 0.2)" 2> "$T/err11" & sleep 0.3
@@ -148,7 +151,7 @@ grep -q "BOX_HOLD_PRIORITY=ci ignored for lane-z" "$T/err11" && grep -q "ignored
   && ok "the ignored request is reported on stderr and in box-hold.log" || bad "no report: [$(cat "$T/err11")]"
 
 # 12. a Runner.Worker ancestor without GITHUB_ACTIONS=true is not CI
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=ci "$T/Runner.Worker" -c 'sh "$0" "$@"; exit $?' "$BH" gpu sh -c "$(job W 0.2)" 2> /dev/null & sleep 0.3
@@ -156,7 +159,7 @@ wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H L1 W " ] && ok "Runner.Worker without GITHUB_ACTIONS=true: a lane" || bad "worker-only order: $(tr '\n' ' ' < "$T/order")"
 
 # 13. board: after CI, before lanes
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb-q38 sh "$BH" gpu sh -c "$(job B1 0.2)" & sleep 0.3
@@ -165,7 +168,7 @@ wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 B1 " ] && ok "board (cl-lb): after CI; with alternation the waiting lane goes between them" || bad "board order: $(tr '\n' ' ' < "$T/order")"
 
 # 14. board for another label
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.2)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-hf-sweep sh "$BH" gpu sh -c "$(job X 0.2)" 2> "$T/err14" & sleep 0.3
@@ -174,7 +177,7 @@ wait
   && ok "board for another label: a lane ticket, reported" || bad "board by another label: $(tr '\n' ' ' < "$T/order") [$(cat "$T/err14")]"
 
 # 15. the board quota
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1.8)" & sleep 0.3
 sh "$BH" gpu sh -c "$(job L1 0.2)" & sleep 0.3
 for b in B1 B2 B3; do BOX_HOLD_PRIORITY=board BOX_HOLD_WHO=cl-lb sh "$BH" gpu sh -c "$(job $b 0.2)" 2>> "$T/err15" & sleep 0.3; done
@@ -191,10 +194,10 @@ printf 'cl-inkling-npu\n' > "$T/lanes"; export BOX_HOLD_LANES=$T/lanes
 q() { BOX_HOLD_WHO="$1" sh "$BH" gpu sleep "${2:-0.1}" 2>> "$T/errq" & sleep 0.2; }
 : > "$T/errq"
 sh "$BH" gpu sleep 3 & sleep 0.3
-q "cl-inkling a"; q "cl-inkling b"; q "cl-inkling c"
+q "cl-inkling a"; q "cl-inkling b"
 s=$(date +%s); BOX_HOLD_WHO="cl-inkling d" sh "$BH" gpu true 2> "$T/err17"; rc=$?; d=$(( $(date +%s) - s ))
-[ "$rc" = 4 ] && [ "$d" -le 1 ] && grep -q "lane cap: 3 queued for cl-inkling" "$T/err17" \
-  && ok "lane cap: the 4th queued ticket of a lane is refused at once (exit 4)" || bad "lane cap: rc $rc after ${d}s [$(cat "$T/err17")]"
+[ "$rc" = 4 ] && [ "$d" -le 1 ] && grep -q "lane cap: 2 queued for cl-inkling" "$T/err17" \
+  && ok "lane cap: the 3rd queued ticket of a lane is refused at once (exit 4)" || bad "lane cap: rc $rc after ${d}s [$(cat "$T/err17")]"
 [ -z "$(grep -l 'cl-inkling d' "$T"/locks/queue/* 2> /dev/null)" ] && ok "  ... and it was never queued" || bad "the refused ticket is in the queue"
 BOX_HOLD_WHO="cl-inkling-npu x" sh "$BH" gpu true 2> "$T/err19a" & n1=$!
 BOX_HOLD_WHO="cl-hf y" sh "$BH" gpu true 2> "$T/err19b" & n2=$!
@@ -209,28 +212,28 @@ wait
 # 18. the running ticket does not count
 : > "$T/errq"
 BOX_HOLD_WHO="cl-inkling run" sh "$BH" gpu sleep 2 & sleep 0.3
-q "cl-inkling a"; q "cl-inkling b"
+q "cl-inkling a"
 BOX_HOLD_WHO="cl-inkling c" sh "$BH" gpu true 2> "$T/err18"; rc=$?
-[ "$rc" = 0 ] && ! grep -q "lane cap" "$T/err18" && ok "the lane's running ticket does not count: a 3rd queued one is accepted" || bad "running counted: rc $rc [$(cat "$T/err18")]"
+[ "$rc" = 0 ] && ! grep -q "lane cap" "$T/err18" && ok "the lane's running ticket does not count: a 2nd queued one is accepted" || bad "running counted: rc $rc [$(cat "$T/err18")]"
 wait
 unset BOX_HOLD_LANES
 
 # 21. alternation: a stream of CI tickets does not starve the lanes
-rm -f "$T/locks/box-last"; : > "$T/order"
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 2)" & sleep 0.3
 for l in L1 L2 L3; do sh "$BH" gpu sh -c "$(job $l 0.2)" & sleep 0.2; done
 for c in C1 C2 C3 C4; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 L1 C2 L2 C3 L3 C4 " ] && ok "a stream of CI tickets: lanes progress every other turn (H C1 L1 C2 L2 C3 L3 C4)" || bad "alternation: $(tr '\n' ' ' < "$T/order")"
 [ ! -e "$T/overlap" ] && ok "  ... never two jobs at once" || bad "overlap seen"
-: > "$T/order"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 sh "$BH" gpu sh -c "$(job H 1)" & sleep 0.3
 for c in C1 C2 C3; do ci gpu sh -c "$(job $c 0.2)" & sleep 0.2; done
 wait
 [ "$(tr '\n' ' ' < "$T/order")" = "H C1 C2 C3 " ] && ok "no lane waiting: CI tickets run back to back" || bad "CI only: $(tr '\n' ' ' < "$T/order")"
 
 # 22. no stall on an older copy's lane waiter
-rm -f "$T/locks/box-last"; : > "$T/order"
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 ci gpu sh -c "$(job C0 1)" & sleep 0.3
 sleep 6 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 2).$old.$st"   # live, no marker line
@@ -243,7 +246,7 @@ kill "$old" 2> /dev/null; wait 2> /dev/null
 # 23. lane FIFO across the copies (review cl-release on #3586): a MARKED lane ticket must not overtake an OLDER
 #     unmarked one (a waiter of a pre-v3 copy) after a priority turn; while the old one waits, the turn goes by the class
 #     order (here: CI), and the marked lane runs only once the older lane ticket is gone
-rm -f "$T/locks/box-last"; : > "$T/order"
+rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
 ci gpu sh -c "$(job C0 1)" & sleep 0.3
 sleep 3 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
 echo "cl-old-lane $(date -u +%FT%TZ) x" > "$T/locks/queue/1-$(printf '%012d' 3).$old.$st"   # live, no marker, oldest lane
@@ -253,6 +256,28 @@ ci gpu sh -c "$(job C2 0.2)" &
 wait "$l2"; wait 2> /dev/null
 [ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 C2 L2 " ] && ok "a marked lane ticket does not overtake an older unmarked one (C0 C1 C2 L2: L2 after the old waiter is gone)" \
   || bad "lane FIFO across copies: $(tr '\n' ' ' < "$T/order") (want C0 C1 C2 L2)"
+
+# 24. original age across a re-submission
+rm -f "$T/locks/box-last"; rm -rf "${T:?}/locks/box-ages"; : > "$T/order"
+sh "$BH" gpu sh -c "$(job H 3)" & sleep 0.3
+BOX_HOLD_WAIT=1 BOX_HOLD_WHO="cl-age A" sh "$BH" gpu sh -c "$(job A 0.2)" 2> /dev/null; rcA=$?   # its 1 s runs out
+BOX_HOLD_WHO="cl-other B" sh "$BH" gpu sh -c "$(job B 0.2)" & sleep 0.3                    # queued AFTER A first was
+BOX_HOLD_WHO="cl-age A" sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3                      # A again: same label + command
+wait
+[ "$rcA" = 4 ] && [ "$(tr '\n' ' ' < "$T/order")" = "H A B " ] && ok "a re-submitted lane ticket keeps its original age (H A B, not H B A)" \
+  || bad "original age: first rc $rcA, order $(tr '\n' ' ' < "$T/order")"
+: > "$T/order"; rm -rf "${T:?}/locks/box-ages"   # each ordering arm starts with no recorded ages (v5)
+sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3
+BOX_HOLD_WHO="cl-other C" sh "$BH" gpu sh -c "$(job C 0.2)" & sleep 0.3
+BOX_HOLD_WHO="cl-age A" sh "$BH" gpu sh -c "$(job A 0.2)" & sleep 0.3                      # A ran: no old age left
+wait
+[ "$(tr '\n' ' ' < "$T/order")" = "H C A " ] && ok "once it has run, the same job queued again is a new ticket (H C A)" || bad "age reuse after a grant: $(tr '\n' ' ' < "$T/order")"
+# 25. no expiry by default for lane tickets
+s=$(date +%s); sh "$BH" gpu sleep 3 & sleep 0.3
+( unset BOX_HOLD_WAIT; BOX_HOLD_WHO="cl-forever x" sh "$BH" gpu true ); rc1=$?; d=$(( $(date +%s) - s ))
+[ "$rc1" = 0 ] && [ "$d" -ge 2 ] && ok "a lane ticket with no BOX_HOLD_WAIT waits it out (rc 0 after ${d}s)" || bad "no-expiry default: rc $rc1 after ${d}s"
+wait
+grep -q '\[ -n "\$w" \] || { \[ "\$pfx" = 1- \] && w=0 || w=3600; }' "$BH" && ok "defaults: lane 0 (no expiry), CI/board 3600" || bad "wait defaults not as specified"
 
 [ "$fail" = 0 ] && echo "box_hold_fifo: PASS" || echo "box_hold_fifo: FAIL"
 exit "$fail"

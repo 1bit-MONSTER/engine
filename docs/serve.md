@@ -451,7 +451,7 @@ without a GPU.
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU engine, in process (in progress) |
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md; the fallback route once a model moves to Loom), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
-| `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
+| `.gguf` | `cpu` | the same llama-server with no GPU layers; asked for by name, with the HRX runtime not started (`GGML_HRX_DISABLE=1`), so it never opens `/dev/kfd` (engine #3590). `auto` in a build without HRX (the same plan, without that variable) |
 | `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
 
 What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these

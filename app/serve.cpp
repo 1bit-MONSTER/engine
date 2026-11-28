@@ -1408,6 +1408,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         argv.push_back("--metrics");   // its /metrics, appended to serve's own
         if (device == "cpu") argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
         else argv.insert(argv.end(), {"--device", "HRX0", "-ngl", "99", "--jinja"});
+        // engine#3590: an explicit --device cpu keeps the HRX runtime from starting (it opened /dev/kfd with nothing
+        // offloaded). Only when asked for by name: auto's CPU fallback is unchanged. A value the caller set wins.
+        if (device == "cpu" && o.device == "cpu") env.push_back("GGML_HRX_DISABLE=1");
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
         if (!o.flash_attn.empty()) { argv.insert(argv.end(), {"-fa", o.flash_attn}); }
         if (o.moe_slots != 0) {

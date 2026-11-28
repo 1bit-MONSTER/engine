@@ -113,11 +113,15 @@ release_ok() {   # the label may ask for the release class (see RELCONF)
     case $_lw in cl-release-rel*) return 0 ;; esac
     _iss=$(printf '%s\n' "$_lw" | grep -oE '#[0-9]+' | tr -d '#')
     [ -n "$_iss" ] || return 1
-    _ll=$(printf '%s\n' "$_lw" | awk '{ print $1 }')
-    # the label's first word must BE the listed lane, or that lane plus a dash suffix (cl-hrxtest-phi2 -> cl-hrxtest)
+    # the label's LANE, derived as everywhere in box-hold (dashed lane names from $LANES, else the first two dash tokens),
+    # must EQUAL a listed lane: a prefix match let cl-inkling-npu claim cl-inkling's issues (review cl-loomfun, #3621)
+    _ll=$(printf '%s\n' "$_lw" | awk -v LANES="${BOX_HOLD_LANES:-/etc/1bit/box-hold-lanes.conf}" '
+        BEGIN { nl = 0; while ((getline l < LANES) > 0) if (l != "" && l !~ /^#/) lanes[++nl] = l }
+        { w = $1; b = ""; for (i = 1; i <= nl; i++) if ((w == lanes[i] || index(w, lanes[i] "-") == 1) && length(lanes[i]) > length(b)) b = lanes[i]
+          if (b == "") { split(w, p, "-"); b = p[1] "-" p[2] }; print b; exit }')
     awk -v w="$_ll" -v iss="$_iss" 'BEGIN { n = split(iss, x, "\n"); for (i = 1; i <= n; i++) want[x[i]] = 1 }
         /^#/ || NF < 2 { next }
-        (w == $1 || index(w, $1 "-") == 1) { for (i = 2; i <= NF; i++) if ($i in want) ok = 1 }
+        w == $1 { for (i = 2; i <= NF; i++) if ($i in want) ok = 1 }
         END { exit !ok }' "$RELCONF" 2> /dev/null
 }
 # The class: ticket names sort CI (0-<n>) < board (0-b-<n>) < previous format (<n>) < lanes (1-<n>), in C collation.

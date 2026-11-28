@@ -18,8 +18,10 @@
 # BOX_HOLD_DIR and a private allow-list (BOX_HOLD_RELEASE_CONF), no device:
 #   1. a release ticket runs after CI and before EVERY lane ticket, even the focus lane's queued tickets (H C R1 R2 A2 B1)
 #   2. a running lane ticket is never cut: the release ticket waits for it to end
-#   3. honoured: a cl-release-rel* label; a listed lane whose label carries one of ITS issues (#3580), also as lane-suffix
-#   4. refused (queued as a lane ticket, reported): no issue number, another lane's issue, an unlisted lane, no label
+#   3. honoured: a cl-release-rel* label; a listed lane whose label carries one of ITS issues (#3580), also as lane-suffix,
+#      and a dashed lane (cl-inkling-npu) by its own issue
+#   4. refused (queued as a lane ticket, reported): no issue number, another lane's issue, an unlisted lane, no label, and
+#      cl-inkling-npu with cl-inkling's issue (exact lane match, review cl-loomfun)
 #   5. release tickets never expire by default; focus prints them
 #   6. split devices on: an npu release ticket goes before the npu lane's queued ticket, while the GPU keeps its own run
 set -uo pipefail
@@ -28,7 +30,8 @@ T=$(mktemp -d) || exit 1
 trap 'kill $(jobs -p) 2> /dev/null; rm -rf "${T:?}" 2> /dev/null' EXIT
 unset GITHUB_ACTIONS BOX_HOLD_WAIT BOX_HOLD_PRIORITY
 export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1 BOX_HOLD_SPLIT_FILE=$T/no-split BOX_HOLD_RELEASE_CONF=$T/rel.conf
-printf '# test list\ncl-hrxtest 3580 3554\ncl-loom 3521\n' > "$T/rel.conf"
+printf '# test list\ncl-hrxtest 3580 3554\ncl-loom 3521\ncl-inkling 3539\ncl-inkling-npu 3335\n' > "$T/rel.conf"
+printf 'cl-inkling-npu\n' > "$T/lanes.conf"; export BOX_HOLD_LANES=$T/lanes.conf   # a dashed lane name, as on the box
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 job() { printf 'if [ -e %q/busy ]; then echo overlap >> %q/overlap; fi; touch %q/busy; echo %s >> %q/order; sleep %s; rm -f %q/busy\n' "$T" "$T" "$T" "$1" "$T" "$2" "$T"; }
 cp "$(command -v bash)" "$T/Runner.Worker"
@@ -51,17 +54,17 @@ wait
 
 # 3. honoured
 reset; : > "$T/locks/box-hold.log"
-for who in "cl-release-rel-rc2" "cl-hrxtest #3554 openelm" "cl-hrxtest-phi2 #3580" "cl-loom #3521 prefill"; do
+for who in "cl-release-rel-rc2" "cl-hrxtest #3554 openelm" "cl-hrxtest-phi2 #3580" "cl-loom #3521 prefill" "cl-inkling-npu #3335 npu" "cl-inkling-npu-b #3335"; do
     REL "$who" X 0.1; done
 grep -q "ignored" "$T/err" && bad "an allowed label was refused: $(cat "$T/err")" || ok "honoured: cl-release-rel*, a listed lane with its issue (also lane-suffix labels)"
 
 # 4. refused
 reset
 L cl-h H 2 & sleep 0.3                                     # a holder, so the refused tickets queue
-for who in "cl-hrxtest phi2-no-issue" "cl-hrxtest #3521 not-mine" "cl-other #3580" ; do REL "$who" X 0.1 & sleep 0.2; done
+for who in "cl-hrxtest phi2-no-issue" "cl-hrxtest #3521 not-mine" "cl-other #3580" "cl-inkling-npu #3539 not-its-lane"; do REL "$who" X 0.1 & sleep 0.2; done
 sleep 0.3; r=$(klass 0-r-); l=$(klass 1-)
-[ "$r" = 0 ] && [ "$l" -ge 3 ] && ok "refused: no issue, another lane's issue, an unlisted lane -> queued as lanes ($l), none in the release class" || bad "refused: $r release, $l lane queued"
-[ "$(grep -c "BOX_HOLD_PRIORITY=release ignored" "$T/err")" -ge 3 ] && grep -q "release class: only labels" "$T/locks/box-hold.log" && ok "  ... each reported on stderr and in box-hold.log" || bad "not reported: $(cat "$T/err")"
+[ "$r" = 0 ] && [ "$l" -ge 3 ] && ok "refused: no issue, another lane's issue, an unlisted lane, cl-inkling-npu with cl-inkling's issue -> lanes ($l), none in the release class" || bad "refused: $r release, $l lane queued"
+[ "$(grep -c "BOX_HOLD_PRIORITY=release ignored" "$T/err")" -ge 4 ] && grep -q "release class: only labels" "$T/locks/box-hold.log" && ok "  ... each reported on stderr and in box-hold.log" || bad "not reported: $(cat "$T/err")"
 wait
 ( unset BOX_HOLD_WHO; BOX_HOLD_PRIORITY=release sh "$BH" gpu true 2> "$T/e5" ); grep -q "ignored" "$T/e5" && ok "no label: refused" || bad "no label: $(cat "$T/e5")"
 

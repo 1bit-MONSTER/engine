@@ -22,7 +22,7 @@
 #   4. the focus passes to the next lane when the focus lane has nothing queued for the grace
 #   5. after the budget the focus passes and the lane goes to the back (its tickets keep their order)
 #   6. CI tickets run between the focus lane's tickets (alternating), never during one
-#   7. `box-hold focus` prints the focus lane, its remaining tickets and the lane order after it
+#   7. `box-hold focus` prints the focus lane, its remaining tickets, the lane order after it and the holder
 #   8. the focus goes by AGE (queue number), not by ticket name: a younger 0-b- ticket of the old board class must not
 #      take it from an older 1- lane ticket (measured at the v6 install, 2026-11-28 04:32Z)
 set -uo pipefail
@@ -95,6 +95,7 @@ L cl-a A1 & sleep 0.2; L cl-a A2 & sleep 0.2; L cl-b B1 & sleep 0.3
 out=$(sh "$BH" focus)
 echo "$out" | grep -q "^focus: cl-a" && echo "$out" | grep -q "^remaining for cl-a:" && [ "$(echo "$out" | grep -c '^  1-')" = 2 ] \
   && echo "$out" | grep -q "1\. cl-b (1 queued)" && ok "box-hold focus: the focus lane, its 2 remaining tickets, then cl-b" || bad "focus print: $out"
+echo "$out" | grep -q "^holder gpu: cl-a " && ok "  ... and who holds the box now (cl-a's running ticket)" || bad "no holder line: $out"
 wait
 
 # 8. focus by age, not by name

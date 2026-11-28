@@ -191,6 +191,10 @@ if [ "$MODE" = focus ]; then
     lanes_by_age | awk -v L="$FL" -v d="$_done" 'BEGIN { n = split(d, x, "\n"); for (i = 1; i <= n; i++) dn[x[i]] = 1 }
         $4 != L { c[$4]++; if (!($4 in o)) { o[$4] = ++k; nm[k] = $4 } }
         END { for (i = 1; i <= k; i++) printf "  %d. %s (%d queued)%s\n", i, nm[i], c[nm[i]], (nm[i] in dn) ? " *" : "" }'
+    for _x in gpu npu; do   # who has the box right now (a CI ticket between lane tickets shows here, not as "running")
+        if flock -n "$D/box-$_x.lock" true 2> /dev/null; then echo "holder $_x: none"
+        else echo "holder $_x: $(cut -c1-100 "$D/box-$_x.who" 2> /dev/null || echo '?')"; fi
+    done
     echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
     exit 0
 fi

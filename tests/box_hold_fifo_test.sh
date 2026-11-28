@@ -48,7 +48,7 @@
 set -u
 BH=${1:?usage: box_hold_fifo_test.sh <box-hold>}
 T=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$T"' EXIT
-export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1   # v6: a 1 s focus grace (300 s on the box) so lanes hand over fast
+export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1 BOX_HOLD_SPLIT_FILE=$T/no-split   # v7: switch off whatever the box has; v6: a 1 s focus grace (300 s on the box) so lanes hand over fast
 unset GITHUB_ACTIONS   # this test runs under a real Runner.Worker in CI: only ci() below may look like CI
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 cp "$(command -v bash)" "$T/Runner.Worker"   # a process's comm is its executable's name: this is what box-hold looks for

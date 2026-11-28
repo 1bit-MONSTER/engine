@@ -35,7 +35,7 @@ BH=${1:?usage: box_hold_lanes_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
 trap 'kill $(jobs -p) 2> /dev/null; rm -rf "${T:?}"' EXIT
 unset GITHUB_ACTIONS BOX_HOLD_WAIT
-export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1
+export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 BOX_HOLD_FOCUS_GRACE=1 BOX_HOLD_SPLIT_FILE=$T/no-split   # v7: switch off
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 job() { printf 'if [ -e %q/busy ]; then echo overlap >> %q/overlap; fi; touch %q/busy; echo %s >> %q/order; sleep %s; rm -f %q/busy\n' "$T" "$T" "$T" "$1" "$T" "$2" "$T"; }
 cp "$(command -v bash)" "$T/Runner.Worker"

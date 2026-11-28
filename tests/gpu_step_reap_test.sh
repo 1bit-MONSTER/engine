@@ -66,5 +66,20 @@ else
         || no "signalled helper: rc $rc, child alive: $(alive e && echo yes || echo no), helper alive: $(kill -0 "$hp" 2> /dev/null && echo yes || echo no), stderr: $(cat "$t/e6")"
 fi
 
+# 7 + 8. the /dev/kfd check counts only what the STEP started (cl-pragent, 2026-11-28: hw-gate run 46087950806's ops
+#        step passed 3611/3611 and failed 125, because another lane's CPU-only llama-perplexity of the same account
+#        opened /dev/kfd the second the step ended). A plain file stands in for the device node.
+: > "$t/fake-kfd"
+holder() { sh -c 'exec 3< "$1"; sleep 30' gpu-step-reap-holder "$t/fake-kfd"; }
+# 7. a stranger of the same uid holding the "device" during the step: not the step's, rc unchanged
+holder & sp=$!; sleep 0.3
+GPU_STEP_REAP_KFD_PATH=$t/fake-kfd HOLD_REAP_GRACE_S=1 sh "$R" 30 true 2> "$t/e7"; rc=$?
+[ $rc = 0 ] && ! grep -q "kfd" "$t/e7" && ok "a same-uid stranger holding /dev/kfd is not blamed on the step (rc 0)" || no "stranger: rc $rc $(cat "$t/e7")"
+kill "$sp" 2> /dev/null; pkill -KILL -f "gpu-step-reap-holder" 2> /dev/null; sleep 0.2
+# 8. a child the step started that left its session with setsid and still holds the "device": 125
+GPU_STEP_REAP_KFD_PATH=$t/fake-kfd HOLD_REAP_GRACE_S=1 sh "$R" 30 sh -c "setsid sh -c 'exec 3< \"\$1\"; sleep 30' gpu-step-reap-holder '$t/fake-kfd' & sleep 0.5" 2> "$t/e8"; rc=$?
+[ $rc = 125 ] && grep -q "the step started" "$t/e8" && ok "a setsid escapee the step started that holds /dev/kfd -> 125" || no "escapee: rc $rc $(cat "$t/e8")"
+pkill -KILL -f "gpu-step-reap-holder" 2> /dev/null; sleep 0.2
+
 echo "gpu_step_reap_test: $([ $bad = 0 ] && echo ok || echo FAIL)"
 [ $bad = 0 ]

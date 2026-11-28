@@ -28,26 +28,31 @@
 #   - afterwards EVERY process still in that session is sent TERM, then KILL after HOLD_REAP_GRACE_S (5). Session
 #     ids survive re-parenting to init, so orphaned grandchildren are found; a process that called setsid itself
 #     is not, which is what the /dev/kfd check below is for;
-#   - finally any process of this uid that still has /dev/kfd open is reported (and, with GPU_STEP_REAP_KFD_KILL=1,
-#     killed). Exit 125 when one survives, so the caller can refuse to release the ticket.
+#   - finally any process THE STEP STARTED that still has /dev/kfd open is reported (and, with GPU_STEP_REAP_KFD_KILL=1,
+#     killed): the step's environment carries GPU_STEP_REAP_ID=<run id>, which every descendant inherits, including
+#     one that called setsid. Exit 125 when one survives, so the caller can refuse to release the ticket.
 #   - the same reap runs when THIS helper is signalled (TERM, INT, HUP: a CI cancel, a job timeout, hw-gate's own
 #     `exit 143` trap). The step is in its own session, so a signal sent to the caller's process group never reaches
 #     it; without this, the run being torn down is the one that leaks (review cl-release, #3583). SIGKILL of the
 #     helper cannot be handled; box-hold's holder and the next ticket's kfd check are what catch that.
 # Scope (reviews cl-release / cl-hyperloom, #3583):
-#   - the /dev/kfd check is by the CALLER's uid on purpose: box-hold serialises GPU tickets, so no other process of
-#     the runner's uid may legitimately hold the GPU now (a coder-llm window server opened outside box-hold trips 125,
-#     which is right). Do not widen it to "this session only" - a child that called setsid itself must still count;
+#   - the /dev/kfd check is by the step's MARKER, not the caller's uid alone (2026-11-28, cl-pragent). The uid-only form
+#     failed hw-gate run 46087950806's ops step, which had passed 3611/3611: another lane's CPU-only job of the same
+#     account (cl-lb's llama-perplexity --device none from the HRX build, which opens /dev/kfd at start) began the
+#     second the step ended. The marker still counts a child that called setsid itself (it inherits the environment),
+#     so nothing the step leaves behind escapes; what it no longer does is blame the step for a stranger;
 #   - a step that escalates (`sudo -n ...`) starts ROOT processes in the session, which the caller cannot signal
 #     (EPERM). They are still listed in /proc, so any process left in the session after the KILL pass, of ANY uid,
 #     makes the helper exit 125 too. A caller that runs GPU work under sudo should run `sudo -n gpu-step-reap ...`.
 # Exit: the step's own exit code (124 if timed out); 143 when the helper itself was signalled (after the reap);
-#       125 when anything of the step's session, or a /dev/kfd opener of this uid, survives the reap.
+#       125 when anything of the step's session, or a /dev/kfd opener the step started, survives the reap.
 set -u
 t=${1:?usage: gpu-step-reap <seconds> <command...>}; shift
 [ $# -gt 0 ] || { echo "gpu-step-reap: no command" >&2; exit 2; }
 grace=${HOLD_REAP_GRACE_S:-5}
 d=$(mktemp -d) || exit 2
+rid=${d##*/}   # this run's id: the step's environment carries it (kfd_of_step)
+KFD=${GPU_STEP_REAP_KFD_PATH:-/dev/kfd}   # the device node checked (a test points it at a plain file)
 t0=$(date +%s); sid=""
 in_session() {  # live pids whose session (field 6 of /proc/<pid>/stat; field 4 after the comm) is $1, of any uid.
     # Zombies (state Z) are skipped: they hold no device, and the leader is one until this helper waits for it.
@@ -57,9 +62,16 @@ in_session() {  # live pids whose session (field 6 of /proc/<pid>/stat; field 4 
         [ "$ss" = "$1" ] && [ "$st" != Z ] && echo "${p#/proc/}"
     done
 }
-kfd_of_uid() {  # pids of this uid with /dev/kfd open
+# The step's environment carries GPU_STEP_REAP_ID=<this run's id>, and every process it starts inherits it - a child that
+# called setsid() too, which the session reap above cannot see. Only those count: measured 2026-11-28 00:50Z on strixhalo,
+# a check by uid alone failed an hw-gate ops step that passed 3611/3611, because another lane's CPU-only job of the same
+# account (llama-perplexity --device none from the HRX build, which opens /dev/kfd at start) began the second the step
+# ended. A process of this uid whose environ is unreadable or lacks the marker is not the step's.
+kfd_of_step() {  # <uid> <run id>: pids of this uid with /dev/kfd open that the step started
     for p in /proc/[0-9]*; do
-        [ "$(stat -c %u "$p" 2> /dev/null)" = "$1" ] && ls -l "$p/fd" 2> /dev/null | grep -q '/dev/kfd' && echo "${p#/proc/}"
+        [ "$(stat -c %u "$p" 2> /dev/null)" = "$1" ] || continue
+        ls -l "$p/fd" 2> /dev/null | grep -qF -- "-> $KFD" || continue
+        tr '\0' '\n' < "$p/environ" 2> /dev/null | grep -qx "GPU_STEP_REAP_ID=$2" && echo "${p#/proc/}"
     done
 }
 reap() {  # TERM, then KILL, everything left in the step's session; prints the survivors
@@ -77,22 +89,22 @@ reap() {  # TERM, then KILL, everything left in the step's session; prints the s
 finish() {  # <exit code>: reap, check, exit (125 when anything survives)
     trap - TERM INT HUP
     surv=$(reap)
-    me=$(id -u); kfd=$(kfd_of_uid "$me")
-    if [ -n "$kfd" ] && [ "${GPU_STEP_REAP_KFD_KILL:-0}" = 1 ]; then kill -KILL $kfd 2> /dev/null; sleep 1; kfd=$(kfd_of_uid "$me"); fi
+    me=$(id -u); kfd=$(kfd_of_step "$me" "$rid")
+    if [ -n "$kfd" ] && [ "${GPU_STEP_REAP_KFD_KILL:-0}" = 1 ]; then kill -KILL $kfd 2> /dev/null; sleep 1; kfd=$(kfd_of_step "$me" "$rid"); fi
     rm -rf "$d"
     if [ -n "$surv" ]; then
         echo "gpu-step-reap: $(echo $surv | wc -w) process(es) of the step's session survived the KILL (another uid? sudo):" $surv "- do NOT release the device ticket" >&2
         exit 125
     fi
     if [ -n "$kfd" ]; then
-        echo "gpu-step-reap: /dev/kfd still open by uid $me after the step:" $kfd "- do NOT release the device ticket" >&2
+        echo "gpu-step-reap: /dev/kfd still open after the step by process(es) the step started (GPU_STEP_REAP_ID=$rid, outside its session):" $kfd "- do NOT release the device ticket" >&2
         exit 125
     fi
     exit "$1"
 }
 trap 'echo "gpu-step-reap: signalled; reaping the step before exiting" >&2; finish 143' TERM INT HUP
 # the leader: records its pid (= the session id), runs the step, records the step's exit code
-setsid sh -c 'echo $$ > "$1/sid"; shift; timeout -k 30 "$@"; echo $? > "'"$d"'/rc"' gpu-step "$d" "$t" "$@" < /dev/null &
+GPU_STEP_REAP_ID=$rid setsid sh -c 'echo $$ > "$1/sid"; shift; timeout -k 30 "$@"; echo $? > "'"$d"'/rc"' gpu-step "$d" "$t" "$@" < /dev/null &
 n=0; while [ ! -s "$d/sid" ] && [ $n -lt 100 ]; do sleep 0.05; n=$((n + 1)); done
 sid=$(cat "$d/sid" 2> /dev/null)
 [ -n "$sid" ] || { echo "gpu-step-reap: the step did not start" >&2; wait; rm -rf "$d"; exit 2; }

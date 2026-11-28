@@ -39,12 +39,20 @@ def main():
     check = lambda n, c, d="": c or fails.append("%s %s" % (n, d))
     with tempfile.TemporaryDirectory() as td:
         td = pathlib.Path(td); env, log = bt.setup(td); sd = td / "screen"
+        # the shared box-hold shim, plus the wait it was given (the "box-hold gpu" prefix keeps holds() counting)
+        bt.write_exe(td / "bin" / "box-hold", '#!/bin/bash\necho "box-hold $1 wait=${BOX_HOLD_WAIT:-unset}" >> %s\nshift\nexec "$@"\n' % log)
         p = subprocess.run(["bash", str(SCREEN), "inkling-loom", str(sd), COMMON, "-", "HL_DRAFT_DEPTH=2"],
                            env=dict(env, SCREEN_EST="1"), capture_output=True, text=True, timeout=600)
         check("screen exits 0", p.returncode == 0, p.stdout[-600:] + p.stderr[-600:])
         filed = sorted(x for x in sd.iterdir() if (x / "screen.json").exists()) if sd.exists() else []
         check("screen files both sets", len(filed) == 2, p.stdout[-800:])
         check("screen used ONE box-hold for both sets", holds(log) == 1, log.read_text() if log.exists() else "")
+        # 28 Nov: the box-side runner must log to a FILE on the box (a dropped ssh closed its stdout and SIGPIPE killed it
+        # after set 0), and the screen must not pass BOX_HOLD_WAIT (box_ticket.sh's 3600 s default made screens expire)
+        rl = list((td / "box" / "out").glob("hl-screen-*/runner.log"))
+        check("the runner's log is a file on the box", bool(rl) and "set 1 rc=" in rl[0].read_text(),
+              str([str(x) for x in rl]))
+        check("the screen ticket is queued with no BOX_HOLD_WAIT", "wait=unset" in log.read_text(), log.read_text()[-300:])
 
         h0 = holds(log)
         p, rep, rd = bt.round_(env, td, "base", HL_SCREEN_DIR=str(sd))

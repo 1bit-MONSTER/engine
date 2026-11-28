@@ -78,12 +78,15 @@ L cl-b B1 & wait; d=$(( $(date +%s) - s ))
 grep -q "focus: cl-a has had nothing queued" "$T/locks/box-hold.log" && ok "  ... and the hand-over is logged" || bad "no hand-over line"
 
 # 5. the budget
-reset; export BOX_HOLD_FOCUS_BUDGET=4
-L cl-a A1 2.5 & sleep 0.2   # 2.5 s each against a 4 s budget (whole seconds): A1 ends inside it, A2 past it -> B1, then A3
-L cl-a A2 2.5 & sleep 0.1; L cl-a A3 0.3 & sleep 0.1; L cl-b B1 0.3 & sleep 0.1
+reset; export BOX_HOLD_FOCUS_BUDGET=6
+L cl-a A1 4 & sleep 0.2   # 4 s each against a 6 s budget (whole seconds): A1 ends inside it, A2 past it -> B1, then A3
+L cl-a A2 4 & sleep 0.1; L cl-a A3 0.3 & sleep 0.1; L cl-b B1 0.3 &
+# all three must be QUEUED before the budget runs out: under load (8.8 on the box) a submission took long enough that
+# B1 was not there yet, and the focus went straight back to cl-a
+for _i in $(seq 1 30); do [ "$(ls "$T/locks/queue" 2> /dev/null | wc -l)" -ge 3 ] && break; sleep 0.1; done
 wait
 [ "$(order)" = "A1 A2 B1 A3 " ] && ok "after its budget the focus lane goes to the back: A1 A2 B1 A3 (A3 keeps its place in A's order)" || bad "budget: $(order)"
-grep -q "focus: cl-a used its 4s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
+grep -q "focus: cl-a used its 6s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"
 unset BOX_HOLD_FOCUS_BUDGET
 
 # 6. CI between the focus lane's tickets

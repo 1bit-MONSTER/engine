@@ -16,6 +16,10 @@ limitations under the License.
 -->
 # AMD mlir-air and IRON on 1bit OS
 
+`pyxrt` is an **optional developer module** for AMD's IRON / mlir-air tools. `1bit serve` and its NPU route never use
+it: they run C++ on the NPU runtime, with no Python in the path. The release checks this on every package: no binary
+in it has libpython NEEDED, and `1bit` names neither pyxrt nor a CPython entry point.
+
 1bit OS has no XRT. Instead it ships a Python module named `pyxrt`, at
 `/opt/1bit-package/1bit/python/pyxrt.cpython-314-x86_64-linux-gnu.so`. AMD's
 [mlir-aie / IRON](https://github.com/Xilinx/mlir-aie) and [mlir-air](https://github.com/Xilinx/mlir-air) host
@@ -46,7 +50,8 @@ export PEANO_INSTALL_DIR=$SP/llvm-aie PATH=$SP/mlir_air/bin:$SP/mlir_aie/bin:$PA
 
 `/opt/1bit-package/1bit/python` must come first on `PYTHONPATH`, ahead of any other `pyxrt`. Check it with
 `python -c 'import pyxrt; print(pyxrt.implementation)'`, which prints `npu_rt`. The NPU device node belongs to
-root on the appliance, so run NPU programs with `sudo -E`.
+root on the appliance, so from a non-root shell run NPU programs with `sudo -E`. The appliance's desktop and console
+sessions run as root and need no sudo.
 
 mlir-air pins a Peano (`llvm-aie`) version in `utils/build-mlir-air-using-wheels.sh` of its checkout. Install
 that version when you build its LLM examples.

@@ -178,6 +178,11 @@ n=$(nm -g --defined-only "$stage/npu/libnpu_rt_api.a" 2>/dev/null | awk '$2=="T"
 [ "$n" = 0 ] || fail "libnpu_rt_api.a exports $n symbols outside the npu_rt_api namespace"
 n=$(strings -a "$stage/npu/libnpu_rt_api.a" | grep -cE '/home/|npu_rt\.cpp' || true)
 [ "$n" = 0 ] || fail "libnpu_rt_api.a names a private source path"
+# Python is never in the NPU runtime's path (orchestrator 2026-11-28): no Python C-API reference and no pyxrt
+n=$(nm "$stage/npu/libnpu_rt_api.a" 2>/dev/null | grep -cE ' U (_?Py[A-Z_]|PyInit_)' || true)
+[ "$n" = 0 ] || fail "libnpu_rt_api.a references the Python C API ($n symbols)"
+n=$(strings -a "$stage/npu/libnpu_rt_api.a" | grep -cE 'pyxrt|libpython' || true)
+[ "$n" = 0 ] || fail "libnpu_rt_api.a names pyxrt or libpython"
 
 # no source files, in any tree
 n=$(find "$stage" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \

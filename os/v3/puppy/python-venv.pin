@@ -1,0 +1,43 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# python-venv.pin: `python3 -m venv` with pip on 1bit OS (owner 28 Nov: AMD's mlir-aie / IRON and mlir-air run on the
+# appliance - users install their wheels into a venv; cl-air's pyxrt, engine#3594). The base ships Python 3.14.4 and
+# usr/lib/python3.14/venv, but NO ensurepip and no pip/setuptools wheels in any layer (measured 28 Nov: puppy, bdrv,
+# fdrv, zdrv: 0 files; strixhalo had them only in its SAVE layer), so on a fresh install `python3 -m venv` fails
+# ("ensurepip is not available"). Measured on strixhalo in a private mount namespace over the pristine image layers:
+# as shipped, venv FAILS; with the 5 files below, venv works and has pip 25.1.1.
+# From Ubuntu resolute (python3.14-venv from resolute-updates): InRelease Good signature (Ubuntu Archive Automatic
+# Signing Key 2018) -> Packages.xz sha256 = InRelease -> each .deb's size + sha256 = Packages. ensurepip reads its wheels
+# from WHEEL_PKG_DIR = /usr/share/python-wheels/ (the image's python3.14 sysconfig). The ensurepip files are byte-identical
+# in 3.14.4-1 and 3.14.4-1ubuntu0.2, so the base's exact 3.14.4 build does not matter for them.
+# Licences: Python (PSF-2.0; the stdlib the base already carries), pip MIT, setuptools MIT (copyrights taken below).
+# stage-debs.sh refuses any other bytes and extracts with dpkg-deb -x (no maintainer scripts).
+#   deb  <package> <version> <url> <sha256> <size>
+#   take <package> <path>          a file of that package, at its image path, mode 0644
+#   base <path>                    must exist in the base (the cut refuses otherwise: re-pin for another Python)
+deb  python3.14-venv        3.14.4-1ubuntu0.2      https://archive.ubuntu.com/ubuntu/pool/universe/p/python3.14/python3.14-venv_3.14.4-1ubuntu0.2_amd64.deb cad2456bf3cb57cb18d2c82b48b549e5b4ac6eee9b3e14e65334209387e3d0ae 5356
+deb  python3-pip-whl        25.1.1+dfsg-1ubuntu2   https://archive.ubuntu.com/ubuntu/pool/universe/p/python-pip/python3-pip-whl_25.1.1+dfsg-1ubuntu2_all.deb ee08bb36dcd86a0e0aa96611d4da8b87a3253c8220b535def261e91631bb47bd 1429504
+deb  python3-setuptools-whl 78.1.1-0.1build1       https://archive.ubuntu.com/ubuntu/pool/universe/s/setuptools/python3-setuptools-whl_78.1.1-0.1build1_all.deb e945108f14dab1ed9ac2ebe813286cca2073c962097bcc8a796bd141c8d15fcb 1173944
+take python3.14-venv        usr/lib/python3.14/ensurepip/__init__.py
+take python3.14-venv        usr/lib/python3.14/ensurepip/__main__.py
+take python3.14-venv        usr/lib/python3.14/ensurepip/_uninstall.py
+take python3-pip-whl        usr/share/python-wheels/pip-25.1.1-py3-none-any.whl
+take python3-pip-whl        usr/share/doc/python3-pip-whl/copyright
+take python3-setuptools-whl usr/share/python-wheels/setuptools-78.1.1-py3-none-any.whl
+take python3-setuptools-whl usr/share/doc/python3-setuptools-whl/copyright
+base usr/bin/python3.14
+base usr/lib/python3.14/venv/__init__.py

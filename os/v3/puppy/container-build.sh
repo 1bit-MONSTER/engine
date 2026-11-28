@@ -237,6 +237,14 @@ RADV_CACHE=/tmp/1bit-radv sh /recipe/stage-radv.sh "$skeleton" || {
     echo "build: REFUSED: could not stage Mesa's RADV driver (stage-radv.sh)" >&2; exit 1; }
 echo "   ok: RADV (Mesa $(awk '$1 == "version" { print $2 }' /recipe/radv.pin)) in the rootfs"
 
+# `python3 -m venv` with pip (os/v3/puppy/python-venv.pin): ensurepip + the pip/setuptools wheels the base lacks
+for f in $(awk '$1 == "base" { print $2 }' /recipe/python-venv.pin); do
+    [ -e "$skeleton/$f" ] || { echo "build: REFUSED: the rootfs has no $f (python-venv.pin): re-pin for its Python" >&2; exit 1; }
+done
+DEBS_CACHE=/tmp/1bit-debs sh /recipe/stage-debs.sh /recipe/python-venv.pin "$skeleton" || {
+    echo "build: REFUSED: could not stage python3 venv + pip (stage-debs.sh)" >&2; exit 1; }
+echo "   ok: python3 -m venv has pip (ensurepip + wheels)"
+
 # The box's own system accounts (useradd -r) get ids 800-899, a range the image's system accounts never use (they sit
 # at 999 down), so an image that adds a system account later cannot collide with one a box made (engine#3555 review).
 sh /recipe/local-system-ids.sh "$skeleton/etc" || {

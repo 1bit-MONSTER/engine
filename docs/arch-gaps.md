@@ -1586,3 +1586,30 @@ bias and no gate, and an `lm_head` with bias.
 
 Remove a class's `watch` field (so the next upload alerts) if a pinned backend gains a graph for it, and record
 `mapped_ok` then.
+
+## 2026-11-28: `Kolibri1_1ForCausalLM` — reviewed, not an alias of `Kolibri1ForCausalLM` (engine#3598)
+
+The 2026-11-28 watcher run alerted one new class, from one uploader: `pdchristian/Kolibri-1.1-NVFP4` (created 2026-11-27,
+0 downloads, Apache-2.0), an NVFP4 requant of **`Aleph-Alpha/Kolibri-1.1`**, whose own config also declares
+`Kolibri1_1ForCausalLM`. The pinned fork (`6a9d7e59`, since #3599) registers only `Kolibri1ForCausalLM` (`conversion/kolibri1.py`,
+an `AfmoeModel` subclass); upstream `ggml-org/llama.cpp` has no `Kolibri1_1` (code search: 0 hits).
+
+Why a mapping to `kolibri1` would be wrong, read from the 1.1 config against Kolibri-1's:
+
+* **Indexed (sparse) attention.** Of the 50 layers, every fifth (4, 9, …, 49) is `indexed_attention`, the rest
+  `sliding_attention`; the indexer itself is computed at `index_layers` 4, 14, 19, 29, configured by `index_topk` 2048, `index_pool_size` 16384, `index_num_heads` 12,
+  `index_compression` 16 and local/sink token counts: a learned indexer picks which past tokens each query attends to.
+  No pinned graph builds that for this family.
+* **Cross-layer KV sharing.** `kv_source_layers` maps many layers to another layer's KV (e.g. layers 9, 14, 49 read
+  layer 4's; 34, 39, 44 read layer 29's), so those layers have no KV projection of their own.
+* `kv_cache_qat: true` (a KV cache trained for quantization).
+
+`Aleph-Alpha/Kolibri-1`'s config has none of these keys, so the 1.1 checkpoint is not a weight-compatible drop-in for the
+`kolibri1` graph. Reported, not alerted (`"watch": "report"`); remove the watch field once a pinned backend gains the
+indexer + KV-sharing graph.
+
+**Related, found while checking:** `Kolibri1ForCausalLM` itself (58 models in the census) is **not** in
+`registry/architectures.json`, although the runtime names `kolibri1`: at the pin, `gguf-py/gguf/constants.py` defines
+`MODEL_ARCH.KOLIBRI1` but has no `MODEL_ARCH_NAMES` and no `MODEL_TENSORS` entry for it, so `tools/registry_build.py`
+(which reads the converter's tables) correctly finds no HF mapping, and converting a Kolibri-1 checkpoint at the pin would
+fail on the name lookup. Filed separately (see the PR); not part of this review.

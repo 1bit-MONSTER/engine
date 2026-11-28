@@ -271,6 +271,11 @@
    "model_type": "sdllm",
    "family": "NVIDIA SDLLM-MDLM masked-diffusion LM, first seen as vllm-denoisers/SDLLM-MDLM-1.7B-Base (a vLLM-denoisers conversion of nvidia/SDLLM-MDLM-1.7B-Base, CC BY-NC 4.0; 2026-11-27 census). 28 layers, hidden 2176, 17 heads, LayerNorm with bias (adaLN folded in), fused qkv_proj, fc1/fc2 MLP with bias (no gate), lm_head with bias, mask id 3, LLaDA-style decode policy over a 256-token canvas. Not an alias of LLaDAModelLM / DreamModel: the pinned llada graph needs RMSNorm and a required ffn_gate (SwiGLU), and neither converter reads this checkpoint's names. Real support = a new diffusion graph, not a mapping.",
    "watch": "report"
+  },
+  "Kolibri1_1ForCausalLM": {
+   "model_type": "kolibri1_1",
+   "family": "Aleph Alpha Kolibri-1.1 (first seen pdchristian/Kolibri-1.1-NVFP4, an NVFP4 requant of Aleph-Alpha/Kolibri-1.1; 2026-11-28 census, 1 uploader). Not an alias of Kolibri1ForCausalLM: the 1.1 config adds indexed_attention layers (every fifth of 50; a sparse-attention indexer computed at index_layers 4/14/19/29: index_topk 2048 over index_pool_size 16384, index_num_heads 12), cross-layer KV sharing (kv_source_layers: layers 9/14/49 reuse layer 4's KV, 34/39/44 reuse layer 29's) and kv_cache_qat; Kolibri-1's config has none of these keys. No pinned or upstream converter registers it. Real support = the indexer + KV-sharing graph, not a mapping.",
+   "watch": "report"
   }
  }
 }

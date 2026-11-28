@@ -72,6 +72,13 @@ loom-fetch huggingface:1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom:chat --m
 - `match`: every key given must hold. `model` compares with serve's model id (`--alias`) and the file
   name; `gguf_sha256` + `gguf_size` name the exact checkpoint the gate measured. The size is compared
   first, so a file of another size is never hashed; an empty table never reads the model.
+  A verified sha256 is cached (engine#3619), so a second load of the same unchanged file does not hash it
+  again (a 17.66 GB GGUF took 124-170 s per load). The key is the file's device, inode, size and `mtime_ns`, and any
+  change to one of them means a new hash: a rewrite, a `touch`, a file renamed over it, a copy. The cache lives in
+  `ONEBIT_LOOM_SHA_CACHE` (set but empty turns it off), else `$XDG_STATE_HOME/1bit/loom-route-sha`, else
+  `~/.local/state/1bit/loom-route-sha`. It is one 0600 record per file in a 0700 directory, written atomically. A
+  record or directory that is not this user's, is group/other-writable or is a symlink is ignored, so the file is
+  hashed as before. A hit logs `sha256 of ... (cached, verified <UTC time>)`.
 - `card`: a fetched Loom package (`loom-fetch`), as a `model.json` or the directory that holds it. A
   relative path resolves under `--loom-cards DIR`, `ONEBIT_LOOM_CARDS`, else `~/.cache/1bit/loom-cards`. Where the
   card came from is not part of the entry: see [Card sources](#card-sources).

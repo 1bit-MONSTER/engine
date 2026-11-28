@@ -163,7 +163,7 @@ build() {
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" \
         -DONEBIT_HF_TOKENIZERS=ON \
-        -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
+        -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" -DONEBIT_PYXRT=ON \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
     guard cmake --build "$BUILD" > "$LOGS/build.log" 2>&1
 }
@@ -384,6 +384,11 @@ package_checks() {  # package_checks <linux tarball>
         [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     fi
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    # pyxrt for 1bit OS (docs/npu-iron-air.md): the release builds it (ONEBIT_PYXRT=ON), so the package carries exactly one,
+    # for the Python it was built with, which is 1bit OS's
+    n=$(find "$t" -path '*/python/pyxrt.cpython-*.so' -type f | wc -l)
+    if [ "$n" = 1 ]; then echo "ok   pyxrt: $(find "$t" -path '*/python/pyxrt.cpython-*.so' -type f -printf '%f')"
+    else echo "FAIL $n python/pyxrt.cpython-*.so in $(basename "$1") (want 1)"; bad=1; fi
     # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): every kernel file is
     # sealed (never a plaintext ELF), no ELF in the tarball is for anything but the host (an NPU
     # kernel would be), the shipped 1bit has no symbol table, and its strings name no private

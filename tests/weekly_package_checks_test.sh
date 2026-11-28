@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# weekly_package_checks_test.sh - three rows of scripts/weekly.sh package_checks (engine#3287), run on miniature
+# weekly_package_checks_test.sh - four rows of scripts/weekly.sh package_checks (engine#3287; pyxrt: docs/npu-iron-air.md), run on miniature
 # engine tarballs. The v2026.48 cut found that each of them failed every release package, the board-tested c35
 # payload included, so a release could only be packaged by hand-waiving 22 FAIL lines:
 #   1. the NPU set count demanded "the 0.6B, 1.7B and 4B sets"; now: at least one signed set, and every set is a
@@ -67,6 +67,7 @@ run() {  # run <name>: package_checks on $w/<name>.tar, output in $w/<name>.out
 # A: what v2026.48 ships - two catalogue sets with AIE kernels, a 1bit whose only private-looking string is public
 a=$w/A; mkdir -p "$a"; mkset "$a" 1024x3072x16x8; mkset "$a" 2560x9728x32x8
 printf 'a public message naming a public file (npu/foo_bar.h:Thing has no hook)\n' > "$a/1bit"
+mkdir -p "$a/python"; elf "$a/python/pyxrt.cpython-314-x86_64-linux-gnu.so" 62   # pyxrt for 1bit OS (docs/npu-iron-air.md)
 run A
 ! has "$w/A.out" "want the 0.6B" && has "$w/A.out" "ok   NPU kernel sets: 2 (1024x3072x16x8 2560x9728x32x8)" &&
     ok "two catalogue sets are what the row asks for (no '0.6B, 1.7B and 4B' demand)" || { no "set count row on A"; cat "$w/A.out"; }
@@ -79,6 +80,7 @@ run A
 b=$w/B; mkdir -p "$b/bin"; mkset "$b" 1024x3072x16x8; mkset "$b" 4096x1x1x1
 elf "$b/bin/stray.so" 1
 printf 'npu/zq_secret.cpp:41: assertion failed\n' > "$b/1bit"
+mkdir -p "$b/python"; elf "$b/python/pyxrt.cpython-314-x86_64-linux-gnu.so" 62; elf "$b/python/pyxrt.cpython-312-x86_64-linux-gnu.so" 62
 run B
 has "$w/B.out" "FAIL NPU kernel set 4096x1x1x1 is not in config/npu-catalogue-sets.json" &&
     ok "a set no catalogue entry can load is refused" || { no "an unknown set geometry passed"; cat "$w/B.out"; }
@@ -87,11 +89,18 @@ grep -q "bin/stray.so is an ELF for machine 1" "$w/B.out" && ! grep -q "layer1.e
 has "$w/B.out" "FAIL the packed 1bit names a private source file (1 strings)" &&
     ok "a whole private file name (zq_secret.cpp) in the 1bit still fails" || { no "zq_secret.cpp was not caught"; grep -i "private" "$w/B.out"; }
 
+has "$w/A.out" "ok   pyxrt: pyxrt.cpython-314-x86_64-linux-gnu.so" && ok "the release package's one pyxrt passes the pyxrt row" ||
+    { no "pyxrt row on A"; grep pyxrt "$w/A.out"; }
+has "$w/B.out" "FAIL 2 python/pyxrt.cpython-*.so in B.tar (want 1)" && ok "two pyxrt builds in one package fail the pyxrt row" ||
+    { no "pyxrt row on B"; grep pyxrt "$w/B.out"; }
+
 # C: no set at all, with WEEKLY_NPU_KERNELS=1
 c=$w/C; mkdir -p "$c"; printf 'nothing\n' > "$c/1bit"
 run C
 has "$w/C.out" "FAIL WEEKLY_NPU_KERNELS=1 but C.tar carries no signed NPU kernel set" &&
     ok "a package with no set fails when the NPU kernels are on" || { no "a set-less package passed the set row"; cat "$w/C.out"; }
+has "$w/C.out" "FAIL 0 python/pyxrt.cpython-*.so in C.tar (want 1)" && ok "a release package without pyxrt fails the pyxrt row" ||
+    { no "pyxrt row on C"; grep pyxrt "$w/C.out"; }
 
 echo "weekly_package_checks_test: $pass passed, $failn failed"
 [ "$failn" = 0 ]

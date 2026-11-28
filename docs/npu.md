@@ -32,6 +32,9 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
+The release also ships a compiled Python module, `python/pyxrt`, so AMD's mlir-aie / IRON and mlir-air
+programs built as full ELFs run on 1bit OS without XRT: [npu-iron-air.md](npu-iron-air.md).
+
 ## What works today
 
 On Linux with the `amdxdna` kernel driver loaded, the engine serves Qwen3-0.6B on the XDNA 2 NPU at

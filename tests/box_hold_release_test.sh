@@ -28,6 +28,10 @@
 #      tickets either: A1 R1 R2 A2, not A1 R1 A2 R2 (2026-11-28 18:09:31Z, cl-220)
 #   8. CI and release alternate: with two CI tickets and a release ticket waiting, C1 R1 C2 - a steady CI stream cannot
 #      starve release verification (main ran C1 C2 R1: every CI ticket before every release ticket)
+#   9. mixed copies do not stall: a release waiter of the copy BEFORE the alternation (it still puts CI first) and CI
+#      waiters of this copy, after a CI turn, must still both run - in either order. Without a guard the new CI waiter
+#      picks the release ticket and the old release waiter picks CI, and nothing starts (review cl-flm, #3635: 16 release
+#      waiters of the installed copy were queued on strixhalo when this was written)
 set -uo pipefail
 BH=${1:?usage: box_hold_release_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -110,6 +114,25 @@ ci gpu sh -c "$(job C1 0.2)" & sleep 0.15; ci gpu sh -c "$(job C2 0.2)" & sleep 
 REL "cl-hrxtest #3580 r1" R1 0.2 & sleep 0.15
 wait
 [ "$(order)" = "H C1 R1 C2 " ] && ok "CI and release alternate: $(order) (a release ticket waits for at most one CI ticket)" || bad "release starved by CI: $(order)"
+
+# 9. mixed copies: an older-copy release waiter + this copy's CI waiters must not wait for each other
+reset
+# the older copy: this box-hold with the head rule before the alternation (CI first whenever CI waits), and any v8.1
+# marker renamed so it cannot pass for this copy
+sed -e 's#if \[ -n "\$_rel" \]; then if \[ "\$_last" = priority \] || \[ -z "\$_ci" \]; then v6head=\$_rel; else v6head=\$_ci; fi#if [ -n "$_rel" ]; then v6head=${_ci:-$_rel}#' \
+    -e 's/box-hold-v8\.1/box-hold-v8-pre-alternation/g' "$BH" > "$T/bh-prealt"
+grep -q 'v6head=${_ci:-$_rel}' "$T/bh-prealt" && sh -n "$T/bh-prealt" || bad "could not derive the pre-alternation copy"
+L cl-h H 1 & sleep 0.3                                                          # a holder, so all three queue
+ci gpu sh -c "$(job C1 0.2)" & sleep 0.15
+BOX_HOLD_PRIORITY=release BOX_HOLD_WHO="cl-hrxtest #3580 r1" sh "$T/bh-prealt" gpu sh -c "$(job R1 0.2)" 2>> "$T/err" & sleep 0.15
+ci gpu sh -c "$(job C2 0.2)" & sleep 0.15
+for _i in $(seq 1 100); do [ "$(wc -l < "$T/order")" -ge 4 ] && break; sleep 0.2; done     # all four, or 20 s
+case "$(order)" in
+    "H C1 C2 R1 "|"H C1 R1 C2 ") ok "mixed copies (older-copy release waiter, this copy's CI) do not stall: $(order)" ;;
+    *) bad "mixed copies stalled: $(order)(an older-copy release waiter and this copy's CI waited for each other)"
+       kill $(jobs -p) 2> /dev/null ;;
+esac
+wait
 
 [ "$fail" = 0 ] && echo "box_hold_release: PASS" || echo "box_hold_release: FAIL"
 exit "$fail"

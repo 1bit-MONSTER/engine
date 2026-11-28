@@ -389,6 +389,23 @@ package_checks() {  # package_checks <linux tarball>
     n=$(find "$t" -path '*/python/pyxrt.cpython-*.so' -type f | wc -l)
     if [ "$n" = 1 ]; then echo "ok   pyxrt: $(find "$t" -path '*/python/pyxrt.cpython-*.so' -type f -printf '%f')"
     else echo "FAIL $n python/pyxrt.cpython-*.so in $(basename "$1") (want 1)"; bad=1; fi
+    # Python stays out of the hot path (orchestrator 2026-11-28): pyxrt is an optional developer module for AMD's IRON /
+    # mlir-air tools; `1bit` (with the NPU runtime compiled in) and every other ELF of the package run without Python.
+    # So no ELF here has libpython NEEDED (a CPython extension never links it either), and `1bit` names no pyxrt, no
+    # libpython and no CPython embedding entry point, so it cannot dlopen pyxrt or start an interpreter.
+    local npy=0 spy=0
+    while IFS= read -r f; do
+        if [ "$(head -c 4 "$f" 2> /dev/null | od -An -tx1 | tr -d ' ')" = 7f454c46 ] &&
+           readelf -d "$f" 2> /dev/null | grep -qE 'NEEDED.*\[libpython'; then
+            echo "FAIL ${f#"$t"/} has libpython NEEDED: Python in the package's runtime path"; npy=$((npy + 1))
+        fi
+    done < <(find "$t" -type f)
+    f=$(find "$t" -maxdepth 2 -name 1bit -type f | head -1)
+    [ -z "$f" ] || spy=$(strings -a "$f" | grep -cE 'pyxrt|libpython|Py_Initialize|PyImport_|PyInit_' || true)
+    [ "$spy" = 0 ] || echo "FAIL 1bit names pyxrt, libpython or a CPython entry point ($spy strings): Python in the NPU route"
+    if [ "$npy" = 0 ] && [ "$spy" = 0 ]; then
+        echo "ok   no Python in the runtime path: no libpython NEEDED in the package, 1bit names no pyxrt / CPython entry point"
+    else bad=1; fi
     # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): every kernel file is
     # sealed (never a plaintext ELF), no ELF in the tarball is for anything but the host (an NPU
     # kernel would be), the shipped 1bit has no symbol table, and its strings name no private

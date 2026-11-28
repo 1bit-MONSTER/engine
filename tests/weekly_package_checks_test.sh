@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# weekly_package_checks_test.sh - four rows of scripts/weekly.sh package_checks (engine#3287; pyxrt: docs/npu-iron-air.md), run on miniature
+# weekly_package_checks_test.sh - five rows of scripts/weekly.sh package_checks (engine#3287; pyxrt + no Python in the runtime path: docs/npu-iron-air.md), run on miniature
 # engine tarballs. The v2026.48 cut found that each of them failed every release package, the board-tested c35
 # payload included, so a release could only be packaged by hand-waiving 22 FAIL lines:
 #   1. the NPU set count demanded "the 0.6B, 1.7B and 4B sets"; now: at least one signed set, and every set is a
@@ -93,6 +93,22 @@ has "$w/A.out" "ok   pyxrt: pyxrt.cpython-314-x86_64-linux-gnu.so" && ok "the re
     { no "pyxrt row on A"; grep pyxrt "$w/A.out"; }
 has "$w/B.out" "FAIL 2 python/pyxrt.cpython-*.so in B.tar (want 1)" && ok "two pyxrt builds in one package fail the pyxrt row" ||
     { no "pyxrt row on B"; grep pyxrt "$w/B.out"; }
+
+has "$w/A.out" "ok   no Python in the runtime path" && ok "a package whose 1bit names no Python passes the no-Python row" ||
+    { no "no-Python row on A"; grep -i python "$w/A.out"; }
+
+# D: Python in the runtime path - a 1bit that would dlopen pyxrt, and (with a C compiler) an ELF with libpython NEEDED
+d=$w/D; mkdir -p "$d/bin"; printf 'dlopen("pyxrt.cpython-314-x86_64-linux-gnu.so") Py_InitializeEx\n' > "$d/1bit"
+if command -v cc > /dev/null && printf 'int f(void){return 0;}\n' > "$w/e.c" &&
+   cc -shared -fPIC -o "$w/libpython3.14.so" -Wl,-soname,libpython3.14.so.1.0 "$w/e.c" 2> /dev/null &&
+   cc -shared -fPIC -o "$d/bin/embeds.so" "$w/e.c" -L"$w" -Wl,--no-as-needed -lpython3.14 2> /dev/null; then needed=1; else needed=0; fi
+run D
+has "$w/D.out" "FAIL 1bit names pyxrt, libpython or a CPython entry point (1 strings)" && ! has "$w/D.out" "ok   no Python in the runtime path" &&
+    ok "a 1bit naming pyxrt / Py_InitializeEx fails the no-Python row" || { no "no-Python strings row on D"; grep -i python "$w/D.out"; }
+if [ "$needed" = 1 ]; then
+    has "$w/D.out" "FAIL D/bin/embeds.so has libpython NEEDED" && ok "an ELF with libpython NEEDED fails the no-Python row" ||
+        { no "libpython NEEDED row on D"; grep -i python "$w/D.out"; }
+else echo "skip  an ELF with libpython NEEDED (no C compiler to build one)"; fi
 
 # C: no set at all, with WEEKLY_NPU_KERNELS=1
 c=$w/C; mkdir -p "$c"; printf 'nothing\n' > "$c/1bit"

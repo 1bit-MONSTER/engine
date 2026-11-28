@@ -83,7 +83,10 @@ L cl-a A1 4 & sleep 0.2   # 4 s each against a 6 s budget (whole seconds): A1 en
 L cl-a A2 4 & sleep 0.1; L cl-a A3 0.3 & sleep 0.1; L cl-b B1 0.3 &
 # all three must be QUEUED before the budget runs out: under load (8.8 on the box) a submission took long enough that
 # B1 was not there yet, and the focus went straight back to cl-a
-for _i in $(seq 1 30); do [ "$(ls "$T/locks/queue" 2> /dev/null | wc -l)" -ge 3 ] && break; sleep 0.1; done
+# wait for B1's OWN ticket (first line "<label> <date> <cmd>"): a ticket leaves queue/ only when its lock is granted, so
+# a count of 3 can be A1 A2 A3 with A1 not granted yet and B1 not queued at all (the race this wait is for)
+_b1=0; for _i in $(seq 1 30); do grep -qs '^cl-b ' "$T"/locks/queue/* && { _b1=1; break; }; sleep 0.1; done
+[ "$_b1" = 1 ] || bad "budget arm SETUP: B1 not queued within 3 s (a slow box, not a scheduling result)"
 wait
 [ "$(order)" = "A1 A2 B1 A3 " ] && ok "after its budget the focus lane goes to the back: A1 A2 B1 A3 (A3 keeps its place in A's order)" || bad "budget: $(order)"
 grep -q "focus: cl-a used its 6s budget" "$T/locks/box-hold.log" && ok "  ... logged" || bad "no budget line"

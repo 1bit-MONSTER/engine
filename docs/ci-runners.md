@@ -543,6 +543,19 @@ waiter of an older box-hold copy takes the lock only when it sorts first, so pre
 nobody to take it. The stub test's last arm pins that the next CI ticket runs at once instead. Lane tickets queued
 before the change keep plain FIFO until they are queued again.
 
+**Release class (owner 2026-11-28, v2026.49).** `BOX_HOLD_PRIORITY=release` puts a ticket after CI and before **every**
+lane ticket. Nothing preempts a running ticket, but no lane ticket, the focus lane's included, starts while a release
+ticket waits.
+- **Who:** a label starting `cl-release-rel` (the release check), or a lane listed in `/etc/1bit/box-hold-release.conf`
+  ([source](../scripts/appliance/box-hold-release.conf), `<lane> <issue>...`) whose label carries one of its issues as
+  `#<number>`, e.g. `BOX_HOLD_WHO="cl-hrxtest #3580 phi2-verify"`. Anything else is queued as a lane ticket and
+  reported.
+- **Tickets:** named `0-r-<n>` (after CI's `0-<n>`, before lanes), never expire by default, 90-min timeout, per device
+  when split. `box-hold focus` counts them.
+- **After the tag:** empty the list. The class then serves `cl-release-rel` only.
+
+Tests: `tests/box_hold_release_test.sh` (ctest `box_hold_release`).
+
 **Split devices (v7, owner 2026-11-28; behind a switch).** This is for testing GPU and NPU used by two different jobs at
 once (the 2026-11-23 both-locks rule; #3372 closed as not reproducible).
 - **Switch:** `/etc/box-hold/split` (`BOX_HOLD_SPLIT_FILE`). Absent means today's behaviour: every ticket takes both

@@ -254,7 +254,7 @@ s=$(date +%s); sh "$BH" gpu sleep 3 & sleep 0.3
 ( unset BOX_HOLD_WAIT; BOX_HOLD_WHO="cl-forever x" sh "$BH" gpu true ); rc1=$?; d=$(( $(date +%s) - s ))
 [ "$rc1" = 0 ] && [ "$d" -ge 2 ] && ok "a lane ticket with no BOX_HOLD_WAIT waits it out (rc 0 after ${d}s)" || bad "no-expiry default: rc $rc1 after ${d}s"
 wait
-grep -q '\[ -n "\$w" \] || { \[ "\$pfx" = 1- \] && w=0 || w=3600; }' "$BH" && ok "defaults: lane 0 (no expiry), CI/board 3600" || bad "wait defaults not as specified"
+grep -qF '[ -n "$w" ] || { { [ "$pfx" = 1- ] || [ "$pfx" = 0-r- ]; } && w=0 || w=3600; }' "$BH" && ok "defaults: lane + release 0 (no expiry), CI 3600" || bad "wait defaults not as specified"
 
 # 26. v5.1: an older copy's ticket gets its age record seeded, and its re-submission keeps its place
 rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)

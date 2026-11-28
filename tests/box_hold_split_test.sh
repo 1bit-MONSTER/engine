@@ -101,16 +101,19 @@ out=$(sh "$BH" focus)
 echo "$out" | grep -q "^pre-v7.1 waiters (the split starts only when this is 0): 1$" && ok "switch off: box-hold focus counts the pre-v7.1 waiters (1)" || bad "pre-v7.1 count: $out"
 kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null
 
-# 8. the split waits for older waiters
-reset; touch "$T/split"; mkdir -p "$T/locks/queue"
-sleep 30 & p1=$!; sleep 0.2; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
-printf 'cl-old %s x\nbox-hold-v3\nbox-hold-v6\nbox-hold-v7\ndev=gpu\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 999999).$p1.$s1"   # a v7 (pre-7.1) waiter (a stub: it never takes its turn)
-echo "cl-a $(date +%s) $(date +%s)" > "$T/locks/box-focus"   # cl-a has the (one-scheduler) focus, so the stub is not waited for
+# 8. the split waits for older waiters: a REAL older waiter (a copy of this box-hold whose tickets lack the v7.1 marker),
+#    no stub ticket (a stub's start time read under load 40 on the box got it swept as dead: flaky)
+reset; touch "$T/split"
+sed 's/box-hold-v7\\nbox-hold-v7.1\\n/box-hold-v7\\n/' "$BH" > "$T/bh-old"
+grep -q 'box-hold-v7.1' "$T/bh-old" && ! grep -q 'box-hold-v7\\nbox-hold-v7.1' "$T/bh-old" || bad "could not derive the older copy"
+BOX_HOLD_WHO=cl-h sh "$BH" gpu sh -c "$(job H 1.5)" & sleep 0.3                     # a holder, so the others queue
+BOX_HOLD_WHO=cl-a sh "$BH" gpu sh -c "$(job G 0.3 npu)" & pg=$!; sleep 0.3           # cl-a: the next lane run
+BOX_HOLD_WHO=cl-old sh "$T/bh-old" gpu sh -c "$(job O 0.3)" & sleep 0.3              # the older waiter, behind G
 out=$(sh "$BH" focus)
 echo "$out" | grep -q "^split devices: REQUESTED .* 1 older-copy waiter" && ok "switch on + an older waiter: focus says the split is requested, not active" || bad "requested print: $out"
-L cl-a gpu G 0.3 npu
-grep -q "held npu G" "$T/probe" && ok "  ... and a gpu ticket takes both locks meanwhile (one scheduler)" || bad "split active beside an older waiter: $(cat "$T/probe") [queue: $(ls "$T/locks/queue" | tr '\n' ' ')]"
-kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null; : > "$T/probe"
+wait "$pg"
+grep -q "held npu G" "$T/probe" && ok "  ... and a gpu ticket takes both locks meanwhile (one scheduler)" || bad "split active beside an older waiter: $(cat "$T/probe") [order: $(seq_)]"
+wait; : > "$T/probe"
 L cl-a gpu G2 0.3 npu
 grep -q "free npu G2" "$T/probe" && ok "  ... once it is gone the split starts by itself (gpu ticket: GPU lock only)" || bad "split did not start: $(cat "$T/probe")"
 

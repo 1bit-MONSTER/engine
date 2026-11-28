@@ -107,16 +107,36 @@ ignored() {   # <why>: a priority asked for and not honoured is said on stderr a
     echo "$_m" >&2
     echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
 }
+RELCONF=${BOX_HOLD_RELEASE_CONF:-/etc/1bit/box-hold-release.conf}
+release_ok() {   # the label may ask for the release class (see RELCONF)
+    _lw=${BOX_HOLD_WHO:-}; [ -n "$_lw" ] || return 1
+    case $_lw in cl-release-rel*) return 0 ;; esac
+    _iss=$(printf '%s\n' "$_lw" | grep -oE '#[0-9]+' | tr -d '#')
+    [ -n "$_iss" ] || return 1
+    # the label's LANE, derived as everywhere in box-hold (dashed lane names from $LANES, else the first two dash tokens),
+    # must EQUAL a listed lane: a prefix match let cl-inkling-npu claim cl-inkling's issues (review cl-loomfun, #3621)
+    _ll=$(printf '%s\n' "$_lw" | awk -v LANES="${BOX_HOLD_LANES:-/etc/1bit/box-hold-lanes.conf}" '
+        BEGIN { nl = 0; while ((getline l < LANES) > 0) if (l != "" && l !~ /^#/) lanes[++nl] = l }
+        { w = $1; b = ""; for (i = 1; i <= nl; i++) if ((w == lanes[i] || index(w, lanes[i] "-") == 1) && length(lanes[i]) > length(b)) b = lanes[i]
+          if (b == "") { split(w, p, "-"); b = p[1] "-" p[2] }; print b; exit }')
+    awk -v w="$_ll" -v iss="$_iss" 'BEGIN { n = split(iss, x, "\n"); for (i = 1; i <= n; i++) want[x[i]] = 1 }
+        /^#/ || NF < 2 { next }
+        w == $1 { for (i = 2; i <= NF; i++) if ($i in want) ok = 1 }
+        END { exit !ok }' "$RELCONF" 2> /dev/null
+}
 # The class: ticket names sort CI (0-<n>) < board (0-b-<n>) < previous format (<n>) < lanes (1-<n>), in C collation.
 pfx=1- cap=0
 case "${BOX_HOLD_PRIORITY:-}" in
     ci)
         if under_runner || [ "$(id -un 2>/dev/null)" = ghrunner ]; then pfx=0- cap=1
         else ignored "not under a GitHub Actions runner, not the runner account"; fi ;;
+    release)   # v8 (owner 2026-11-28 15:45Z, v2026.49): release-class tickets run after CI and before every lane ticket
+        if release_ok; then pfx=0-r-
+        else ignored "release class: only labels starting cl-release-rel, or a lane listed in $RELCONF whose label carries one of its issues as #<number>"; fi ;;
     board)   # v6 (owner 2026-11-28, lane runs): no separate board priority - cl-lb's tickets run as cl-lb's lane run
         ignored "the board class is folded into lane runs (v6): cl-lb's tickets run when cl-lb has the focus" ;;
     '') ;;
-    *) ignored "no such class (ci, board)" ;;
+    *) ignored "no such class (ci, release)" ;;
 esac
 # ---- box-hold v6: LANE RUNS (owner 2026-11-28: "stop splitting GPU time between lanes - give the box to ONE lane until
 # its job is done") ----
@@ -160,8 +180,8 @@ scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6> <num
           while ((getline l < tf) > 0) { if (++ln == 1) first = l; if (l == "box-hold-v3") v3 = 1; if (l == "box-hold-v6") v6 = 1
               if (l == "box-hold-v7") v7 = 1; if (l == "box-hold-v7.1") v71 = 1; if (l ~ /^dev=(gpu|npu|both)$/) dv = substr(l, 5) }
           close(tf); split(first, w, " ")
-          kind = (f ~ /^0-/ && f !~ /^0-b-/) ? "ci" : "lane"
-          num = a[1]; sub(/^(0-b-|0-|1-)/, "", num); num = num + 0   # the queue number = the age (whatever the prefix)
+          kind = (f ~ /^0-r-/) ? "rel" : (f ~ /^0-/ && f !~ /^0-b-/) ? "ci" : "lane"
+          num = a[1]; sub(/^(0-b-|0-r-|0-|1-)/, "", num); num = num + 0   # the queue number = the age (whatever the prefix)
           print "LIVE " f " " kind " " laneof(w[1]) " " v3 " " v6 " " num " " dv " " v7 " " v71 }'
 }
 # lane tickets oldest first BY QUEUE NUMBER (a 0-b- ticket of the old board class sorts before 1- by name, not by age:
@@ -187,6 +207,8 @@ ctx() {   # <all|gpu|npu>: the state and filter of one focus
 }
 running_shown() {   # the running lane, or who holds the lock when no v6/v7 record says (an older copy's or a CI ticket)
     _r=$(running_lane); [ -n "$_r" ] && { echo "$_r"; return; }
+    # split, and a ticket granted while it was off (both locks, the shared record): still a lane run (2026-11-28 16:16Z)
+    if [ -n "$FX" ]; then _r=$(FX=""; running_lane); [ -n "$_r" ] && { echo "$_r (granted before the split: both locks)"; return; }; fi
     for _x in gpu npu; do
         case $DEVF in all|"$_x") ;; *) continue ;; esac
         flock -n "$D/box-$_x.lock" true 2> /dev/null || { echo "- ($_x held by: $(cut -d' ' -f1-2 "$D/box-$_x.who" 2> /dev/null), no lane-run record: an older copy's or a CI ticket)"; return; }
@@ -256,6 +278,7 @@ if [ "$MODE" = focus ]; then
     split_on && _mk=10 || _mk=6
     echo "older-copy waiters (skipped by v$((_mk == 10 ? 7 : 6)), they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk -v m=$_mk '$1 == "LIVE" && $3 == "lane" && $m != 1 { n++ } END { print n + 0 }')"
     split_on || echo "pre-v7.1 waiters (the split starts only when this is 0): $(older_waiters)"
+    echo "release tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "rel" { n++ } END { print n + 0 }') (after CI, before every lane ticket)"
     echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
     exit 0
 fi
@@ -303,7 +326,7 @@ if [ "$pfx" = 1- ]; then
     fi
 fi
 w=${BOX_HOLD_WAIT-}
-[ -n "$w" ] || { [ "$pfx" = 1- ] && w=0 || w=3600; }
+[ -n "$w" ] || { { [ "$pfx" = 1- ] || [ "$pfx" = 0-r- ]; } && w=0 || w=3600; }   # lane + release: no expiry
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 # the second line marks a waiter that knows the alternation rule: only such a lane ticket is preferred after a priority
 # turn (a waiter of an older box-hold copy waits for whatever sorts first, and preferring it would stall the queue)
@@ -330,7 +353,10 @@ $( { printf '%s\n' "$SCAN" | on_dev | awk -v m="$MK" '$3 == "ci" && (m == 6 || $
         $3 == "lane" && $4 == L && ft == "" { ft = $2; v6 = $6 } END { print (ci == "" ? "-" : ci), (ft == "" ? "-" : ft), v6 + 0 }')
 EOF
     [ "$_ci" = - ] && _ci=""; [ "$_ft" = - ] && _ft=""
-    if [ -n "$_ft" ] && { [ "$_last" = priority ] || [ -z "$_ci" ]; }; then v6head=$_ft
+    # v8: release-class tickets (oldest first) run after CI and before EVERY lane ticket: no lane ticket starts while one waits
+    _rel=$(printf '%s\n' "$SCAN" | on_dev | awk -v m="$MK" '$3 == "rel" && (m == 6 || $m == 1)' | sort -k7,7n | awk 'NR == 1 { print $2 }')
+    if [ -n "$_rel" ]; then v6head=${_ci:-$_rel}
+    elif [ -n "$_ft" ] && { [ "$_last" = priority ] || [ -z "$_ci" ]; }; then v6head=$_ft
     elif [ -n "$_ci" ]; then v6head=$_ci
     else v6head=""; fi
     # act on v6's choice only when that ticket's waiter is a v6 one (marker): otherwise an older waiter could be waiting

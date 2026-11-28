@@ -154,3 +154,8 @@ add_test(NAME box_hold_lanes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_lan
 # box-hold v7 SPLIT DEVICES (owner 2026-11-28), behind /etc/box-hold/split: switch absent = both locks; on = gpu/npu
 # tickets take one lock each, one lane run per device, a 'both' ticket blocks new starts on both until it runs.
 add_test(NAME box_hold_split COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_split_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)
+
+# scripts/appliance/50github-runner (the strixhalo-bench runner's boot script): HOME is the account's home, not the boot
+# environment's / (2026-11-28: every hw-gate job failed in "Prepare the appliance runner"), and the running check is
+# anchored to this runner's listener (the pr-agent runner's must not stop it). Stub sudo/pgrep, no runner.
+add_test(NAME appliance_runner_init COMMAND bash ${CMAKE_SOURCE_DIR}/tests/appliance_runner_init_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/50github-runner)

@@ -1300,6 +1300,56 @@ pyxrt_verdict() {
     esac
 }
 
+# loom_routes_verdict <results file>: engine#3618. rc1 shipped NO route cards (the payload's loom-cards was empty), so
+# every Loom-route model was served on the llama.cpp fallback - Qwen3.8-27B at 13.11 tok/s against its route's 17.85
+# leader - and no row noticed. One line per route of the shipped table (the payload's config/loom-routes.json):
+#   <id> <card: ok | missing:<where>> <gguf: - (not downloaded) | path> <plan: loom | fallback:<serve's reason> | rc<N>:<why>>
+# FAIL when any route has no usable card, or any downloaded route model does not plan loom-serve; PASS when every card is
+# there and at least one route model planned loom; SKIP when the cards are there but no route model is downloaded (the
+# plan is not proved; the board run fetches one for chat-loom first). "NOTABLE" = no routes table (an older payload).
+# Pure, for --self-test.
+loom_routes_verdict() {
+    [ -s "${1:-}" ] || { printf 'SKIP the payload carries no Loom route table (config/loom-routes.json)'; return 0; }
+    awk '
+        { n++; id = $1; card = $2; gguf = $3; plan = $4; for (i = 5; i <= NF; i++) plan = plan " " $i
+          if (card != "ok") { nc++; mc = mc (mc == "" ? "" : ", ") id " (" substr(card, 9) ")" }
+          if (gguf != "-") { ng++; if (plan == "loom") nl++; else { nf++; mf = mf (mf == "" ? "" : "; ") id ": " plan } } }
+        END {
+            if (nc > 0 || nf > 0) {
+                printf "FAIL"
+                if (nc > 0) printf " %d of %d Loom route(s) have no usable card, so their models serve on the llama.cpp fallback: %s.", nc, n, mc
+                if (nf > 0) printf " %d downloaded route model(s) did not plan loom-serve: %s", nf, mf
+                exit }
+            if (nl > 0) { printf "PASS all %d Loom routes have their card; %d downloaded route model(s) plan loom-serve (1bit serve --print-backend rc 5, route matched by sha256)", n, nl; exit }
+            printf "SKIP all %d Loom routes have their card, but no route model is downloaded, so no plan was proved", n }' "$1"
+}
+
+# loom_routes_scan <routes json> <cards dir> <loom-serve> <HF cache> <1bit binary> <gpu 1/0> <out file>: writes one
+# loom_routes_verdict line per route (see there). The row below runs it on the image; --self-test on a fake tree.
+loom_routes_scan() {
+    : > "$7"
+    [ -r "$1" ] && command -v python3 > /dev/null 2>&1 || return 0
+    python3 -I -c 'import json,sys
+for r in json.load(open(sys.argv[1]))["routes"]:
+    m = r.get("match", {}); print(r["id"], r["card"], m.get("gguf_size", 0))' "$1" 2> /dev/null |
+    while read -r _id _card _size; do
+        _c=${_card%/model.json}
+        if [ -f "$2/$_c/model.json" ]; then _cs=ok
+        elif [ -d "/opt/1bit-package/loom-cards/$_c" ]; then _cs="missing:not-assembled-in-$2"
+        else _cs=missing:payload; fi
+        _g=$( [ "$_size" -gt 0 ] 2> /dev/null && find -L "$4" -name '*.gguf' -size "${_size}c" 2> /dev/null | head -1)
+        if [ -z "$_g" ] || [ -z "$5" ] || [ "$6" != 1 ]; then printf '%s %s - -\n' "$_id" "$_cs" >> "$7"; continue; fi
+        ONEBIT_LOOM_CARDS=$2 ONEBIT_LOOM_SERVE=$3 timeout 600 "$5" serve -m "$_g" --device hrx --print-backend \
+            > "$7.out" 2> "$7.err" < /dev/null
+        _rc=$?
+        if [ "$_rc" = 5 ] && grep -q -- "loom route $_id: .*-> loom-serve card " "$7.err"; then _p=loom
+        elif _w=$(grep -m1 -o "loom route $_id [^:]*, but [^:]*" "$7.err"); then _p="fallback:${_w#*, but }"
+        else _p="rc$_rc:$(tail -n 1 "$7.err" | cut -c1-100)"; fi
+        printf '%s %s %s %s\n' "$_id" "$_cs" "$_g" "$_p" >> "$7"
+        rm -f "$7.out" "$7.err"
+    done
+}
+
 # python_venv_verdict <python3 present 1/0> <`python3 -m venv` rc> <the venv's `pip --version` output>: users install
 # Python wheels (AMD's IRON / mlir-air for the NPU, engine#3594) into a venv, and the base shipped venv WITHOUT ensurepip
 # or pip wheels, so `python3 -m venv` failed on a fresh install ("ensurepip is not available"; os/v3/puppy/
@@ -1585,6 +1635,31 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(python_venv_verdict 1 1 '')"                                     # the base as shipped: no ensurepip
     check FAIL "$(python_venv_verdict 1 0 '/tmp/v/bin/python: No module named pip')"
     check SKIP "$(python_venv_verdict 0 1 '')"
+    _lrt=$(mktemp 2> /dev/null || echo /tmp/1bit-lrt.$$)
+    printf 'qwen3-4b-q4_k_m ok /m/a.gguf loom\ninkling ok - -\n' > "$_lrt"
+    check PASS "$(loom_routes_verdict "$_lrt")"
+    printf 'qwen3-4b-q4_k_m ok - -\ninkling ok - -\n' > "$_lrt"
+    check SKIP "$(loom_routes_verdict "$_lrt")"
+    printf 'qwen38-27b missing:payload /m/q.gguf fallback:card is not usable\nqwen3-4b ok /m/a.gguf loom\n' > "$_lrt"   # rc1
+    check FAIL "$(loom_routes_verdict "$_lrt")"
+    printf 'qwen3-4b ok - -\nqwen3-8b missing:payload - -\n' > "$_lrt"           # a card missing, its model not downloaded
+    check FAIL "$(loom_routes_verdict "$_lrt")"
+    printf 'qwen3-4b ok /m/a.gguf rc0:planned llama-server\n' > "$_lrt"             # the card is there, the plan is not loom
+    check FAIL "$(loom_routes_verdict "$_lrt")"
+    : > "$_lrt"; check SKIP "$(loom_routes_verdict "$_lrt")"; rm -f "$_lrt"
+    if command -v python3 > /dev/null 2>&1 && command -v truncate > /dev/null 2>&1; then   # the scan, on a fake tree
+        _ft=$(mktemp -d 2> /dev/null || echo /tmp/1bit-lrs.$$); mkdir -p "$_ft/cards/CardA" "$_ft/hf/hub/x" "$_ft/bin"
+        printf '{"routes":[{"id":"ra","card":"CardA","match":{"gguf_size":4096}},{"id":"rb","card":"CardB","match":{"gguf_size":8192}}]}' > "$_ft/r.json"
+        echo '{}' > "$_ft/cards/CardA/model.json"; truncate -s 4096 "$_ft/hf/hub/x/a.gguf"; truncate -s 8192 "$_ft/hf/hub/x/b.gguf"
+        printf '#!/bin/sh\ncase "$3" in *a.gguf) echo "1bit serve: loom route ra: x -> loom-serve card CardA (model m)" >&2; echo "1bit serve: --print-backend: --device loom is not a llama-server; run 1bit serve itself" >&2; exit 5 ;;\n*) echo "1bit serve: loom route rb has the size of $3, but its card is not usable (card path CardB is not a model.json inside the cards directory): serving on the llama.cpp route" >&2; echo "{}"; exit 0 ;; esac\n' > "$_ft/bin/1bit"; chmod 755 "$_ft/bin/1bit"
+        loom_routes_scan "$_ft/r.json" "$_ft/cards" /x "$_ft/hf" "$_ft/bin/1bit" 1 "$_ft/out"
+        check "ra ok $_ft/hf/hub/x/a.gguf loom" "$(sed -n 1p "$_ft/out")"
+        check "rb missing:payload $_ft/hf/hub/x/b.gguf fallback:its card is not usable (card path CardB is not a model.json inside the cards directory)" "$(sed -n 2p "$_ft/out")"
+        check FAIL "$(loom_routes_verdict "$_ft/out" | cut -c1-4)"
+        loom_routes_scan "$_ft/r.json" "$_ft/cards" /x "$_ft/hf" "$_ft/bin/1bit" 0 "$_ft/out"   # no GPU: cards only
+        check "ra ok - -" "$(sed -n 1p "$_ft/out")"
+        rm -rf "$_ft"
+    fi
     check PASS "$(pyxrt_verdict 1 'ok npu_rt')"
     check FAIL "$(pyxrt_verdict 1 'ok xrt')"
     check FAIL "$(pyxrt_verdict 1 'fail ModuleNotFoundError: No module named pyxrt')"   # a module for another Python
@@ -2814,6 +2889,28 @@ case "$_lv" in
     *)     fail chat-loom "${_lv#FAIL }" ;;
 esac
 
+# ── loom-routes: every Loom route has its card, and a downloaded route model plans loom-serve (engine#3618) ──────
+# In the environment lemond gives `1bit serve` (10lemonade: ONEBIT_LOOM_CARDS, ONEBIT_LOOM_SERVE). For each route of the
+# shipped table: its card must be a model.json in the cards dir (1bit-loom-cards assembles it there at boot from the
+# payload's loom-cards); its GGUF is looked for in the Hugging Face cache by the route's exact size, and when found,
+# `1bit serve -m <it> --device hrx --print-backend` must exit 5 ("--device loom is not a llama-server") with serve's
+# "loom route <id>: ... -> loom-serve card" line - rc 0 is a llama-server plan: the fallback rc1 shipped. A 27B GGUF
+# takes ~2-3 min to hash (the route matches by sha256). Runs after chat-loom, so a model --fetch pulled is counted.
+_lrj=/opt/1bit-package/1bit/config/loom-routes.json
+_lrc=${ONEBIT_LOOM_CARDS:-/data/loom-cards}
+_lrs=${ONEBIT_LOOM_SERVE:-/opt/1bit-package/loom/loom-serve}
+_lrhf=${HF_HOME:-}; [ -n "$_lrhf" ] || { [ -d /data/lemonade ] && _lrhf=/data/lemonade/huggingface || _lrhf=/var/lib/lemonade/huggingface; }
+_lrb=/opt/1bit-package/1bit/1bit; [ -x "$_lrb" ] || _lrb=$(command -v 1bit 2> /dev/null)
+_lrt=$(mktemp 2> /dev/null || echo /tmp/1bit-loom-routes.$$)
+loom_routes_scan "$_lrj" "$_lrc" "$_lrs" "$_lrhf" "$_lrb" "$_lg" "$_lrt"
+LR=$(loom_routes_verdict "$_lrt")
+sed 's/^/info  loom-route: /' "$_lrt" | cut -c1-200
+rm -f "$_lrt"
+case "$LR" in
+    PASS*) pass loom-routes "${LR#PASS }" ;;
+    SKIP*) skip loom-routes "${LR#SKIP }" ;;
+    *)     fail loom-routes "${LR#FAIL }" ;;
+esac
 # ── no account keeps a base image's default password (the save layer's shadow copy outlives the image's fix) ─────────
 if [ -r /etc/shadow ]; then
     _dp=

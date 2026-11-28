@@ -202,6 +202,9 @@ if [ -f "$stage/hrx/llama/bin/llama-server" ]; then
 fi
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
+# the Loom route table the binary compiles in (CMakeLists.txt reads the same file), so the release check can test every
+# route on the image: its card is there, and its model plans loom-serve (engine#3618)
+mkdir -p "$stage/config" && cp "$src/config/loom-routes.json" "$stage/config/"
 # the stock Lemonade PPA's lemond (Ubuntu 26.04) runs our HRX llama-server through lemonade-hrx
 # (docs/lemonade.md, "Ubuntu 26.04: the PPA's lemond"); install-lemonade-ppa.sh wires its drop-in
 if [ -x "$stage/hrx/llama/bin/llama-server" ]; then

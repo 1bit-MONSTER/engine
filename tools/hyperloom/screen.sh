@@ -24,7 +24,9 @@
 #     COMMON      pins every round of the run carries, K=V,K=V (e.g. HL_CARD_NAME=qwen38-27b-3e43d41d,HL_RUNS=3)
 #     SET         the lever set of one measurement, K=V,K=V; "-" = the baseline (COMMON only)
 #   env: HL_BOX, HL_BOX_DIR, HL_SSH (as box_ticket.sh), SCREEN_BUDGET (seconds of measurement in the ticket, 2400),
-#        SCREEN_EST (seconds one set is expected to take, 420; a set starts only if it fits), HL_HOLD_WAIT (43200)
+#        SCREEN_EST (seconds one set is expected to take, 420; a set starts only if it fits). No BOX_HOLD_WAIT: since
+#        box-hold v6 (28 Nov) lane tickets never expire, and box_ticket.sh's HL_HOLD_WAIT default (3600) made screens
+#        give up after 1 h in a deep queue
 #
 # Values are restricted to [A-Za-z0-9._:/+-]; the workload's own entrypoint still validates every lever when a round
 # reads the measurement (an invalid one is refused there, exactly as without the cache).
@@ -66,7 +68,10 @@ done
 
 echo "[screen] $T: $n sets, workload $WL rev $REV, budget ${BUDGET}s"
 tar -C "$HERE/$WL" -cf - "${FILES[@]}" | $HL_SSH "$HL_BOX" "mkdir -p $RDIR $B && tar -C $RDIR -xf -" || exit 1
-$HL_SSH -o ServerAliveInterval=30 "$HL_BOX" "BOX_HOLD_WHO='cl-hyperloom $T' BOX_HOLD_WAIT=${HL_HOLD_WAIT:-43200} box-hold gpu bash -c '$runner'" \
+# The box-side runner logs to a FILE on the box, never to the ssh channel: on 28 Nov a dropped ssh client (the driver
+# died with its session) closed the runner's stdout, and its first echo after set 0 killed it with SIGPIPE -- the
+# remaining sets never ran. Now the ticket finishes whatever happens to this side, and the log is read back at the end.
+$HL_SSH -o ServerAliveInterval=30 "$HL_BOX" "BOX_HOLD_WHO='cl-hyperloom $T' box-hold gpu bash -c '$runner' > $B/runner.log 2>&1 < /dev/null; cat $B/runner.log" \
     < /dev/null | tee "$SD/$T.log"
 for i in $(seq 0 $((n - 1))); do
     d=$SD/${KEYS[i]}

@@ -23,10 +23,14 @@
 # (52github-runner-pr-agent, user ghrunner), and with that one up first this runner never started. Not by path: after a
 # runner self-update the listener may run as ./bin/Runner.Listener (review cl-flm, #3609), and the pr-agent one could
 # too, so only the user tells them apart.
+# And by process NAME (pgrep -x, /proc/<pid>/comm), not the command line: on this box every lane's ssh commands run as
+# bcloud, and `pgrep -f` matched any shell whose argv merely mentions Runner.Listener (review cl-flm, #3612).
+# comm is cut at 15 characters and "Runner.Listener" is exactly 15: a renamed or wrapped listener (a longer name, or a
+# shell in front of it) would no longer match, and this script would start a second runner (review cl-hyperloom, #3616).
 D=${GITHUB_RUNNER_DIR:-/home/bcloud/actions-runner}
 case "${1:-start}" in
   start)
-    if ! pgrep -u bcloud -f 'Runner\.Listener( |$)' > /dev/null 2>&1; then
+    if ! pgrep -u bcloud -x Runner.Listener > /dev/null 2>&1; then   # the process NAME (comm): a shell whose argv mentions it is not a listener
       sudo -H -u bcloud env HOME=/home/bcloud bash -c "cd $D && setsid nohup ./run.sh > runner.log 2>&1 < /dev/null &" 2> /dev/null
     fi
     ;;

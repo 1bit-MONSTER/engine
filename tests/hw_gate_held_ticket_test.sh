@@ -35,7 +35,7 @@ sed -n '/^HELD_PID="" HELD_T0=0/,/^box_ticket() {/p' "$gate" | sed '$d' > "$fn"
 grep -q '^hold_for() {' "$fn" && grep -q '^hold_acquire() {' "$fn" && grep -q '^hold_release() {' "$fn" \
   || { echo "FAIL: the held-ticket helpers are no longer where this test finds them"; exit 1; }
 unset GITHUB_ACTIONS GITHUB_RUN_ID
-export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 TMPDIR=$T BOX_HOLD_FOCUS_GRACE=1   # v6: short lane-run grace
+export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 TMPDIR=$T BOX_HOLD_FOCUS_GRACE=1 BOX_HOLD_SPLIT_FILE=$T/no-split   # v6: short lane-run grace; v7 switch off
 free_now() { ( exec 8> "$T/locks/box-gpu.lock"; flock -n 8 ) 2> /dev/null; }   # 0 = nobody holds the GPU lock
 seq_n() { cat "$T/locks/box-seq" 2> /dev/null || echo 0; }
 drive() {   # runs a script in a shell that has the helpers, BOX_HOLD=real box-hold

@@ -150,3 +150,7 @@ add_test(NAME box_hold_fifo COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_fifo
 # to back with no queued cap, keeps the focus within the grace, hands over after the grace or its budget, and CI runs
 # between its tickets; `box-hold focus` prints the state. Stub jobs on a private BOX_HOLD_DIR, no device.
 add_test(NAME box_hold_lanes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_lanes_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)
+
+# box-hold v7 SPLIT DEVICES (owner 2026-11-28), behind /etc/box-hold/split: switch absent = both locks; on = gpu/npu
+# tickets take one lock each, one lane run per device, a 'both' ticket blocks new starts on both until it runs.
+add_test(NAME box_hold_split COMMAND bash ${CMAKE_SOURCE_DIR}/tests/box_hold_split_test.sh ${CMAKE_SOURCE_DIR}/scripts/appliance/box-hold)

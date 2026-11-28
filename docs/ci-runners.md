@@ -542,6 +542,25 @@ waiter of an older box-hold copy takes the lock only when it sorts first, so pre
 nobody to take it. The stub test's last arm pins that the next CI ticket runs at once instead. Lane tickets queued
 before the change keep plain FIFO until they are queued again.
 
+**Split devices (v7, owner 2026-11-28; behind a switch).** This is for testing GPU and NPU used by two different jobs at
+once (the 2026-11-23 both-locks rule; #3372 closed as not reproducible).
+- **Switch:** `/etc/box-hold/split` (`BOX_HOLD_SPLIT_FILE`). Absent means today's behaviour: every ticket takes both
+  locks, with one lane run for the box. Every poll reads it, so a trial can switch it on or off without draining the
+  queue.
+- **With the switch on:**
+  1. **Locks:** a `gpu` ticket takes only the GPU lock, an `npu` ticket only the NPU lock, and `both` takes both.
+  2. **Two lane-run focuses, one per device:** the gpu focus is the lane with the oldest ticket needing the GPU; the npu
+     focus is the lane with the oldest npu ticket. Each follows the v6 rules: back to back, grace, budget, CI between
+     tickets, the cap of 2 for lanes without a focus. State files are suffixed `-gpu` / `-npu`.
+  3. **'both' tickets:** a 'both' ticket that heads either device heads both. Neither device takes a new start until
+     both are free and it has started, so a chaining lane on the other device can't starve it. The oldest such ticket
+     wins, so two of them can't block each other.
+  4. **`box-hold focus`:** prints both lane runs.
+- **Older waiters:** with the switch on, only v7 waiters' tickets (marker `box-hold-v7`) are picked. Older waiters take
+  both locks by their own rule. Switch on when `box-hold focus` shows 0 older-copy waiters.
+
+Tests: `tests/box_hold_split_test.sh` (ctest `box_hold_split`).
+
 **Lane runs (v6, owner 2026-11-28: "stop splitting GPU time between lanes - give the box to ONE lane until its job is
 done").** box-hold gives the GPU to one lane at a time:
 1. **Focus lane:** the lane owning the oldest waiting lane ticket. While it has tickets queued, only its tickets run,

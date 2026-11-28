@@ -26,6 +26,8 @@
 #   6. split devices on: an npu release ticket goes before the npu lane's queued ticket, while the GPU keeps its own run
 #   7. a focus-lane waiter of a copy OLDER than the release class (it reads 0-r- tickets as CI) does not jump the release
 #      tickets either: A1 R1 R2 A2, not A1 R1 A2 R2 (2026-11-28 18:09:31Z, cl-220)
+#   8. CI and release alternate: with two CI tickets and a release ticket waiting, C1 R1 C2 - a steady CI stream cannot
+#      starve release verification (main ran C1 C2 R1: every CI ticket before every release ticket)
 set -uo pipefail
 BH=${1:?usage: box_hold_release_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -100,6 +102,14 @@ BOX_HOLD_WHO=cl-a sh "$T/bh-old" gpu sh -c "$(job A2 0.2)" 2>> "$T/err" & sleep 
 REL "cl-hrxtest #3580 r1" R1 0.6 & sleep 0.15; REL "cl-loom #3521 r2" R2 0.2 & sleep 0.15
 wait
 [ "$(order)" = "A1 R1 R2 A2 " ] && ok "an older copy's focus-lane waiter waits for every release ticket: $(order)" || bad "older copy jumped the release queue: $(order)"
+
+# 8. CI and release alternate
+reset
+L cl-h H 1 & sleep 0.3                                                         # a holder, so all three queue
+ci gpu sh -c "$(job C1 0.2)" & sleep 0.15; ci gpu sh -c "$(job C2 0.2)" & sleep 0.15
+REL "cl-hrxtest #3580 r1" R1 0.2 & sleep 0.15
+wait
+[ "$(order)" = "H C1 R1 C2 " ] && ok "CI and release alternate: $(order) (a release ticket waits for at most one CI ticket)" || bad "release starved by CI: $(order)"
 
 [ "$fail" = 0 ] && echo "box_hold_release: PASS" || echo "box_hold_release: FAIL"
 exit "$fail"

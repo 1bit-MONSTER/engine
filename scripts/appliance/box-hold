@@ -355,7 +355,10 @@ EOF
     [ "$_ci" = - ] && _ci=""; [ "$_ft" = - ] && _ft=""
     # v8: release-class tickets (oldest first) run after CI and before EVERY lane ticket: no lane ticket starts while one waits
     _rel=$(printf '%s\n' "$SCAN" | on_dev | awk -v m="$MK" '$3 == "rel" && (m == 6 || $m == 1)' | sort -k7,7n | awk 'NR == 1 { print $2 }')
-    if [ -n "$_rel" ]; then v6head=${_ci:-$_rel}
+    # ... alternating with CI: after a CI turn ("priority" - only CI writes it, a release turn is written "lane") the
+    # oldest release ticket goes next, so a steady CI stream (hw-gate, hrx-build, reviewer windows on every P0 push during
+    # the freeze) cannot starve release verification: a release ticket waits for at most one CI ticket (review #3621)
+    if [ -n "$_rel" ]; then if [ "$_last" = priority ] || [ -z "$_ci" ]; then v6head=$_rel; else v6head=$_ci; fi
     elif [ -n "$_ft" ] && { [ "$_last" = priority ] || [ -z "$_ci" ]; }; then v6head=$_ft
     elif [ -n "$_ci" ]; then v6head=$_ci
     else v6head=""; fi

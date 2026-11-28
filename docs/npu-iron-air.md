@@ -54,7 +54,15 @@ root on the appliance, so from a non-root shell run NPU programs with `sudo -E`.
 sessions run as root and need no sudo.
 
 mlir-air pins a Peano (`llvm-aie`) version in `utils/build-mlir-air-using-wheels.sh` of its checkout. Install
-that version when you build its LLM examples.
+that version when you build its LLM examples. Those examples' host code also imports PyTorch, on the CPU, and reads
+weights with `safetensors` / `huggingface_hub`:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install safetensors huggingface_hub tokenizers transformers
+```
+
+IRON designs alone need neither.
 
 ## IRON
 

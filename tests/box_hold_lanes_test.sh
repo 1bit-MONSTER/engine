@@ -25,6 +25,9 @@
 #   7. `box-hold focus` prints the focus lane, its remaining tickets, the lane order after it and the holder
 #   8. the focus goes by AGE (queue number), not by ticket name: a younger 0-b- ticket of the old board class must not
 #      take it from an older 1- lane ticket (measured at the v6 install, 2026-11-28 04:32Z)
+#   9. a lane whose queued tickets all have OLDER-copy waiters (no box-hold-v6 marker) is idle to v6: the next lane runs
+#      (2026-11-28 05:10Z: such a focus lane left the box idle 36 min)
+#  10. a holder SIGKILLed during its command does not pin the focus: the next lane runs after the grace (review cl-flm)
 set -uo pipefail
 BH=${1:?usage: box_hold_lanes_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -107,6 +110,23 @@ printf 'cl-lb-q %s y\nbox-hold-v3\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/0-b-
 out=$(sh "$BH" focus)
 echo "$out" | grep -q "^focus: cl-a" && ok "the focus goes to the OLDEST lane ticket's lane (cl-a #5), not to a younger 0-b- name (cl-lb #9)" || bad "focus by name: $out"
 kill "$p1" "$p2" 2> /dev/null; wait "$p1" "$p2" 2> /dev/null
+
+# 9. old-copy-only lane: skipped, not a stall
+reset; mkdir -p "$T/locks/queue"
+sleep 60 & p1=$!; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
+printf 'cl-old %s x\nbox-hold-v3\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 1).$p1.$s1"   # older copy's waiter: never starts on v6's word
+s=$(date +%s); timeout 10 env BOX_HOLD_WHO=cl-b sh "$BH" gpu sh -c "$(job B1 0.2)"; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 0 ] && [ "$(order)" = "B1 " ] && [ "$d" -le 3 ] && ok "a lane with only older-copy waiters is skipped: B1 ran in ${d}s (no stall)" || bad "old-copy focus stall: rc $rc $(order) ${d}s"
+out=$(sh "$BH" focus)   # captured: under pipefail, grep -q would SIGPIPE the writer
+echo "$out" | grep -q "^older-copy waiters (skipped by v6.*: 1$" && ok "  ... and box-hold focus counts it" || bad "old-copy count: $out"
+kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null
+
+# 10. SIGKILLed holder
+reset
+BOX_HOLD_WHO=cl-aaa sh "$BH" both sh -c 'sleep 2' & pk=$!; sleep 0.6
+kill -9 "$pk"; wait "$pk" 2> /dev/null; sleep 2   # its command ends on its own
+s=$(date +%s); timeout 10 env BOX_HOLD_WHO=cl-bbb sh "$BH" both sh -c "$(job B-RAN 0.1)"; rc=$?; d=$(( $(date +%s) - s ))
+[ "$rc" = 0 ] && [ "$(order)" = "B-RAN " ] && ok "a SIGKILLed holder does not pin the focus: the next lane ran (${d}s)" || bad "stale running: rc $rc $(order) [$(cat "$T/locks/box-running")]"
 
 [ "$fail" = 0 ] && echo "box_hold_lanes: PASS" || echo "box_hold_lanes: FAIL"
 exit "$fail"

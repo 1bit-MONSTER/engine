@@ -38,7 +38,7 @@
 #      to back
 #  22. an older copy's lane waiter (its ticket has no box-hold-v3 marker) is NOT preferred after a priority turn: the
 #      next CI ticket runs at once instead of the queue stalling on a waiter that never takes the lock (21:57Z 11-27)
-#  23. ... and a younger MARKED lane ticket does not overtake that older unmarked one (lane FIFO across the copies)
+#  23. (v6, orchestrator 2026-11-28) an older copy's lane ticket is SKIPPED by v6: the younger v6 ticket takes the lane turn
 #  24. v5: a lane ticket whose wait ran out and is re-submitted (same label + command) keeps its ORIGINAL age: it runs
 #      before a lane ticket first queued after it; once it has run, the same job queued again is a new, young ticket
 #  25. v5: a lane ticket waits for ever by default (no BOX_HOLD_WAIT) and with BOX_HOLD_WAIT=0; a CI ticket keeps 3600
@@ -221,9 +221,8 @@ s=$(date +%s); wait "$c1"; d=$(( $(date +%s) - s ))
   || bad "stall on an unmarked lane waiter: $(tr '\n' ' ' < "$T/order") after ${d}s"
 kill "$old" 2> /dev/null; wait 2> /dev/null
 
-# 23. lane FIFO across the copies (review cl-release on #3586): a MARKED lane ticket must not overtake an OLDER
-#     unmarked one (a waiter of a pre-v3 copy) after a priority turn; while the old one waits, the turn goes by the class
-#     order (here: CI), and the marked lane runs only once the older lane ticket is gone
+# 23. older copies' lane tickets are skipped by v6 (2026-11-28 05:10Z: waiting on one left the box idle 36 min): the
+#     younger v6 ticket takes the lane turn after C0 (was v5: it waited behind the unmarked one, C0 C1 C2 L2)
 rm -f "$T/locks/box-last"; : > "$T/order"; rm -rf "${T:?}/locks/box-ages"; : > "$T/locks/box-focus"; : > "$T/locks/box-running"; : > "$T/locks/box-focus-done"   # each ordering arm: no ages, no focus (v5/v6)
 ci gpu sh -c "$(job C0 1)" & sleep 0.3
 sleep 3 & old=$!; st=$(sed 's/.*) //' "/proc/$old/stat" | cut -d' ' -f20)
@@ -232,8 +231,8 @@ sh "$BH" gpu sh -c "$(job L2 0.2)" & l2=$!; sleep 0.2                           
 ci gpu sh -c "$(job C1 0.2)" & sleep 0.2
 ci gpu sh -c "$(job C2 0.2)" &
 wait "$l2"; wait 2> /dev/null
-[ "$(tr '\n' ' ' < "$T/order")" = "C0 C1 C2 L2 " ] && ok "a marked lane ticket does not overtake an older unmarked one (C0 C1 C2 L2: L2 after the old waiter is gone)" \
-  || bad "lane FIFO across copies: $(tr '\n' ' ' < "$T/order") (want C0 C1 C2 L2)"
+[ "$(tr '\n' ' ' < "$T/order")" = "C0 L2 C1 C2 " ] && ok "an older copy's lane ticket is skipped: the v6 ticket takes the lane turn (C0 L2 C1 C2)" \
+  || bad "old-copy skip: $(tr '\n' ' ' < "$T/order") (want C0 L2 C1 C2)"
 
 # 24. original age across a re-submission
 rm -f "$T/locks/box-last"; rm -rf "${T:?}/locks/box-ages"; : > "$T/order"

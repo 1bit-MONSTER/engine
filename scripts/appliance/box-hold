@@ -64,7 +64,7 @@ seed_ages() {
 }
 if [ "${1:-}" = seed ]; then seed_ages; exit 0; fi
 MODE=run
-if [ "${1:-}" = focus ]; then MODE=focus; set -- both true; fi   # `box-hold focus`: print the lane run state, take nothing
+if [ "${1:-}" = focus ]; then MODE=focus; set -- both true; fi   # `box-hold focus`: print the lane run state, take no lock (it may advance the focus, as any waiter would)
 dev=${1:?usage: box-hold <gpu|npu|both> <command...> | box-hold seed | box-hold focus}; shift
 [ $# -gt 0 ] || { echo "box-hold: no command" >&2; exit 2; }
 # 2026-11-23 orchestrator: GPU and NPU are never held by two different jobs at once (06:29Z hard reset, reset reason 0x00800800, GPU ticket + separate NPU ticket); every ticket takes both locks until that is understood.
@@ -147,12 +147,23 @@ scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6>" per
 # lane tickets oldest first BY QUEUE NUMBER (a 0-b- ticket of the old board class sorts before 1- by name, not by age:
 # measured at the v6 install, 2026-11-28 04:32Z, it handed the focus to cl-lb over cl-hyperloom's older ticket)
 lanes_by_age() { printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "lane"' | sort -k7,7n; }
+# ... and only those a v6 waiter will take (the box-hold-v6 marker): an older copy's waiter never starts on v6's word, so
+# a lane whose queued tickets all have older waiters is IDLE to v6 (2026-11-28 05:10Z: cl-hyperloom held the focus with
+# pre-v6 waiters only and the box sat idle 36 min). Older copies' tickets are skipped by v6; they still take the box by
+# their own rule when they find themselves first.
+v6_lanes_by_age() { lanes_by_age | awk '$6 == 1'; }
+running_lane() {   # the lane of the running lane ticket, if its box-hold is still alive ("LANE PID STARTTIME")
+    read _rl _rp _rs < "$D/box-running" 2>/dev/null || return 0
+    if [ -n "$_rp" ]; then [ "$(starttime "$_rp")" = "$_rs" ] && echo "$_rl"; return 0; fi
+    # a record of the first v6 build (lane only): running only while a lock is held
+    flock -n "$D/box-gpu.lock" true 2> /dev/null && flock -n "$D/box-npu.lock" true 2> /dev/null || echo "$_rl"
+}
 focus_log() { echo "$(date -u +%FT%TZ) box-hold: $*" >> "$D/box-hold.log" 2>/dev/null; }
 update_focus() {   # uses $SCAN; sets FL (the focus lane, empty when no lane waits) and FS / FLAST
     exec 6>>"$D/box-focus.lock"; flock 6
     read FL FS FLAST < "$D/box-focus" 2>/dev/null || { FL="" FS=0 FLAST=0; }
-    _now=$(date +%s); _run=$(cat "$D/box-running" 2>/dev/null)
-    _order=$(lanes_by_age | awk '!s[$4]++ { print $4 }')
+    _now=$(date +%s); _run=$(running_lane)   # a SIGKILLed holder's record is stale, not "running" (review cl-flm)
+    _order=$(v6_lanes_by_age | awk '!s[$4]++ { print $4 }')
     if [ -n "$FL" ]; then
         if [ $((_now - FS)) -ge "$FOCUS_BUDGET" ] && [ "$_run" != "$FL" ]; then
             echo "$FL $_now" >> "$D/box-focus-done"; focus_log "focus: $FL used its ${FOCUS_BUDGET}s budget -> back of the lane order"; FL=""
@@ -182,19 +193,20 @@ if [ "$MODE" = focus ]; then
     SCAN=$(scan); update_focus; _now=$(date +%s)
     if [ -z "$FL" ]; then echo "focus: none (no lane ticket waiting)"
     else
-        echo "focus: $FL - since $(date -u -d "@$FS" +%FT%TZ 2>/dev/null || echo "$FS") ($(( (_now - FS) / 60 )) of $((FOCUS_BUDGET / 60)) min used), last activity $((_now - FLAST)) s ago, running: $(cat "$D/box-running" 2>/dev/null || echo -)"
+        echo "focus: $FL - since $(date -u -d "@$FS" +%FT%TZ 2>/dev/null || echo "$FS") ($(( (_now - FS) / 60 )) of $((FOCUS_BUDGET / 60)) min used), last activity $((_now - FLAST)) s ago, running: $(running_lane)"
         echo "remaining for $FL:"
-        lanes_by_age | awk -v L="$FL" -v Q="$Q" '$4 == L { getline l < (Q "/" $2); close(Q "/" $2); print "  " $2 "  " substr(l, 1, 70) }'
+        v6_lanes_by_age | awk -v L="$FL" -v Q="$Q" '$4 == L { getline l < (Q "/" $2); close(Q "/" $2); print "  " $2 "  " substr(l, 1, 70) }'
     fi
     echo "then (lane order by oldest ticket; * = had its budget, waits for the others):"
     _done=$(awk '{ print $1 }' "$D/box-focus-done" 2>/dev/null)
-    lanes_by_age | awk -v L="$FL" -v d="$_done" 'BEGIN { n = split(d, x, "\n"); for (i = 1; i <= n; i++) dn[x[i]] = 1 }
+    v6_lanes_by_age | awk -v L="$FL" -v d="$_done" 'BEGIN { n = split(d, x, "\n"); for (i = 1; i <= n; i++) dn[x[i]] = 1 }
         $4 != L { c[$4]++; if (!($4 in o)) { o[$4] = ++k; nm[k] = $4 } }
         END { for (i = 1; i <= k; i++) printf "  %d. %s (%d queued)%s\n", i, nm[i], c[nm[i]], (nm[i] in dn) ? " *" : "" }'
     for _x in gpu npu; do   # who has the box right now (a CI ticket between lane tickets shows here, not as "running")
         if flock -n "$D/box-$_x.lock" true 2> /dev/null; then echo "holder $_x: none"
         else echo "holder $_x: $(cut -c1-100 "$D/box-$_x.who" 2> /dev/null || echo '?')"; fi
     done
+    echo "older-copy waiters (skipped by v6, they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "lane" && $6 != 1 { n++ } END { print n + 0 }')"
     echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
     exit 0
 fi
@@ -267,7 +279,7 @@ while :; do
     # v6's choice: CI alternates with the focus lane's tickets; with the focus lane's queue empty (its grace) only CI runs
     # (read, never `set --`: "$@" is the command this ticket runs)
     read _ci _ft _ftv6 <<EOF
-$( { printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci"'; lanes_by_age; } | awk -v L="$FL" '$3 == "ci" && ci == "" { ci = $2 }
+$( { printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci"'; v6_lanes_by_age; } | awk -v L="$FL" '$3 == "ci" && ci == "" { ci = $2 }
         $3 == "lane" && $4 == L && ft == "" { ft = $2; v6 = $6 } END { print (ci == "" ? "-" : ci), (ft == "" ? "-" : ft), v6 + 0 }')
 EOF
     [ "$_ci" = - ] && _ci=""; [ "$_ft" = - ] && _ft=""
@@ -276,8 +288,8 @@ EOF
     else v6head=""; fi
     # act on v6's choice only when that ticket's waiter is a v6 one (marker): otherwise an older waiter could be waiting
     # for a ticket that is waiting for it (the 2026-11-27 21:57Z stall); fall back to v5's choice
-    if [ -n "$v6head" ] && [ "$v6head" = "$_ft" ] && [ "$_ftv6" != 1 ]; then head=$v5head
-    elif [ -z "$v6head" ] && [ -z "$FL" ]; then head=$v5head
+    # (v6 picks only tickets of v6 waiters, so the one it picks always starts; v5's choice only when v6 has none)
+    if [ -z "$v6head" ] && [ -z "$FL" ]; then head=$v5head
     else head=$v6head; fi
     if [ "$head" = "$me" ]; then
         if flock -n 8; then
@@ -299,7 +311,7 @@ echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/de
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
 [ -n "$agekey" ] && rm -f "$AGES/$agekey" 2>/dev/null   # granted: this job's original age is used up
 case $me in 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last" 2>/dev/null   # the class of this turn (alternation)
-if [ "$pfx" = 1- ]; then echo "$mylane" > "$D/box-running" 2>/dev/null; touch_focus "$mylane"; fi   # the lane run goes on
+if [ "$pfx" = 1- ]; then echo "$mylane $$ $(starttime $$)" > "$D/box-running" 2>/dev/null; touch_focus "$mylane"; fi   # the lane run goes on (live record)
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP
 if [ "$cap" = 1 ]; then

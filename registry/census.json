@@ -12,15 +12,15 @@
   "models": 443925,
   "with_architecture": 347988,
   "architectures_seen": 3153,
-  "mapped_models": 328897,
-  "mapped_pct": 94.51,
+  "mapped_models": 328955,
+  "mapped_pct": 94.53,
   "checked_models": 220613,
   "checked_pct": 63.4,
   "per_backend": {
    "hrx": {
-    "mapped": 328897,
+    "mapped": 328955,
     "checked": 220613,
-    "mapped_pct": 94.51,
+    "mapped_pct": 94.53,
     "checked_pct": 63.4
    },
    "npu": {

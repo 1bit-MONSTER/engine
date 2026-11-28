@@ -80,7 +80,14 @@ dev=${1:?usage: box-hold <gpu|npu|both> <command...> | box-hold seed | box-hold 
 case $dev in gpu|npu|both) ;; *) echo "box-hold: gpu, npu or both" >&2; exit 2 ;; esac
 reqdev=$dev   # what the ticket asks for; it takes both locks unless the split switch is on at its grant (v7)
 SPLITF=${BOX_HOLD_SPLIT_FILE:-/etc/box-hold/split}
-split_on() { [ -e "$SPLITF" ]; }
+# v7.1 (2026-11-28 09:20Z, the "stall" under split): the split is ACTIVE only when every live waiter is a v7.1 one. Older
+# copies' waiters run their own one-focus scheduler and take BOTH locks whenever both are free; beside a split they made
+# a second scheduler (a pre-v7 'both' job held the box with no running record: it looked like a stall). With the switch
+# on and older waiters left, v7.1 behaves as v6 (both locks, one focus: the scheduler those waiters follow); the split
+# starts by itself when the last one is gone. Needs $SCAN.
+split_requested() { [ -e "$SPLITF" ]; }
+older_waiters() { printf '%s\n' "${SCAN:-}" | awk '$1 == "LIVE" && $10 != 1 { n++ } END { print n + 0 }'; }
+split_on() { split_requested && [ "$(older_waiters)" = 0 ]; }
 poll=${BOX_HOLD_POLL:-2}
 Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
 (umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log $D/box-last $D/box-focus.lock $D/box-focus-done $D/box-focus $D/box-running $D/box-focus-gpu $D/box-focus-npu $D/box-focus-done-gpu $D/box-focus-done-npu $D/box-running-gpu $D/box-running-npu $D/box-last-gpu $D/box-last-npu) 2>/dev/null
@@ -137,7 +144,7 @@ lane_of() {   # <label> -> the lane: its first word's cl-/pi- lane (dashed names
           b = ""; for (i = 1; i <= nl; i++) if ((w == lanes[i] || index(w, lanes[i] "-") == 1) && length(lanes[i]) > length(b)) b = lanes[i]
           if (b != "") { print b; exit }; split(w, p, "-"); print p[1] "-" p[2]; exit }'
 }
-scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6> <number> <dev> <v7>" per live ticket, "DEAD <name>" per dead one
+scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6> <number> <dev> <v7> <v7.1>" per live ticket, "DEAD <name>" per dead one
     ls "$Q" 2>/dev/null | LC_ALL=C sort | awk -v Q="$Q" -v LANES="$LANES" '
         BEGIN { nl = 0; while ((getline l < LANES) > 0) if (l != "" && l !~ /^#/) lanes[++nl] = l }
         function laneof(w,   i, b, p) {
@@ -149,13 +156,13 @@ scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6> <num
           st = ""; sf = "/proc/" a[2] "/stat"
           if ((getline x < sf) > 0) { sub(/.*\) /, "", x); split(x, y, " "); st = y[20] }; close(sf)
           if (st == "" || st != a[n]) { print "DEAD " f; next }
-          tf = Q "/" f; first = ""; v3 = 0; v6 = 0; v7 = 0; dv = "both"; ln = 0
+          tf = Q "/" f; first = ""; v3 = 0; v6 = 0; v7 = 0; v71 = 0; dv = "both"; ln = 0
           while ((getline l < tf) > 0) { if (++ln == 1) first = l; if (l == "box-hold-v3") v3 = 1; if (l == "box-hold-v6") v6 = 1
-              if (l == "box-hold-v7") v7 = 1; if (l ~ /^dev=(gpu|npu|both)$/) dv = substr(l, 5) }
+              if (l == "box-hold-v7") v7 = 1; if (l == "box-hold-v7.1") v71 = 1; if (l ~ /^dev=(gpu|npu|both)$/) dv = substr(l, 5) }
           close(tf); split(first, w, " ")
           kind = (f ~ /^0-/ && f !~ /^0-b-/) ? "ci" : "lane"
           num = a[1]; sub(/^(0-b-|0-|1-)/, "", num); num = num + 0   # the queue number = the age (whatever the prefix)
-          print "LIVE " f " " kind " " laneof(w[1]) " " v3 " " v6 " " num " " dv " " v7 }'
+          print "LIVE " f " " kind " " laneof(w[1]) " " v3 " " v6 " " num " " dv " " v7 " " v71 }'
 }
 # lane tickets oldest first BY QUEUE NUMBER (a 0-b- ticket of the old board class sorts before 1- by name, not by age:
 # measured at the v6 install, 2026-11-28 04:32Z, it handed the focus to cl-lb over cl-hyperloom's older ticket)
@@ -176,7 +183,15 @@ running_lane() {   # the lane of the running lane ticket, if its box-hold is sti
     flock -n "$D/box-gpu.lock" true 2> /dev/null && flock -n "$D/box-npu.lock" true 2> /dev/null || echo "$_rl"
 }
 ctx() {   # <all|gpu|npu>: the state and filter of one focus
-    case $1 in all) FX="" DEVF=all MK=6 ;; *) FX=-$1 DEVF=$1 MK=9 ;; esac
+    case $1 in all) FX="" DEVF=all MK=6 ;; *) FX=-$1 DEVF=$1 MK=10 ;; esac
+}
+running_shown() {   # the running lane, or who holds the lock when no v6/v7 record says (an older copy's or a CI ticket)
+    _r=$(running_lane); [ -n "$_r" ] && { echo "$_r"; return; }
+    for _x in gpu npu; do
+        case $DEVF in all|"$_x") ;; *) continue ;; esac
+        flock -n "$D/box-$_x.lock" true 2> /dev/null || { echo "- ($_x held by: $(cut -d' ' -f1-2 "$D/box-$_x.who" 2> /dev/null), no lane-run record: an older copy's or a CI ticket)"; return; }
+    done
+    echo "-"
 }
 focus_log() { echo "$(date -u +%FT%TZ) box-hold: $*" >> "$D/box-hold.log" 2>/dev/null; }
 update_focus() {   # uses $SCAN; sets FL (the focus lane, empty when no lane waits) and FS / FLAST
@@ -213,7 +228,7 @@ print_focus() {   # one focus (ctx set)
     update_focus; _now=$(date +%s)
     if [ -z "$FL" ]; then echo "focus: none (no lane ticket waiting)"
     else
-        echo "focus: $FL - since $(date -u -d "@$FS" +%FT%TZ 2>/dev/null || echo "$FS") ($(( (_now - FS) / 60 )) of $((FOCUS_BUDGET / 60)) min used), last activity $((_now - FLAST)) s ago, running: $(running_lane)"
+        echo "focus: $FL - since $(date -u -d "@$FS" +%FT%TZ 2>/dev/null || echo "$FS") ($(( (_now - FS) / 60 )) of $((FOCUS_BUDGET / 60)) min used), last activity $((_now - FLAST)) s ago, running: $(running_shown)"
         echo "remaining for $FL:"
         v6_lanes_by_age | awk -v L="$FL" -v Q="$Q" '$4 == L { getline l < (Q "/" $2); close(Q "/" $2); print "  " $2 "  " substr(l, 1, 70) }'
     fi
@@ -225,6 +240,9 @@ print_focus() {   # one focus (ctx set)
 }
 if [ "$MODE" = focus ]; then
     SCAN=$(scan)
+    if split_requested && ! split_on; then
+        echo "split devices: REQUESTED ($SPLITF), not active: $(older_waiters) older-copy waiter(s) left; until they are gone every ticket takes both locks (one lane run); the split starts by itself"
+    fi
     if split_on; then
         echo "split devices: ON ($SPLITF): one lane run per device"
         for _x in gpu npu; do ctx $_x; echo "== $_x"; print_focus; done
@@ -235,9 +253,9 @@ if [ "$MODE" = focus ]; then
         if flock -n "$D/box-$_x.lock" true 2> /dev/null; then echo "holder $_x: none"
         else echo "holder $_x: $(cut -c1-100 "$D/box-$_x.who" 2> /dev/null || echo '?')"; fi
     done
-    split_on && _mk=9 || _mk=6
-    echo "older-copy waiters (skipped by v$((_mk == 9 ? 7 : 6)), they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk -v m=$_mk '$1 == "LIVE" && $3 == "lane" && $m != 1 { n++ } END { print n + 0 }')"
-    split_on || echo "pre-v7 waiters (switch the split on when this is 0: while split they are skipped and take both locks by their own rule): $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $9 != 1 { n++ } END { print n + 0 }')"
+    split_on && _mk=10 || _mk=6
+    echo "older-copy waiters (skipped by v$((_mk == 10 ? 7 : 6)), they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk -v m=$_mk '$1 == "LIVE" && $3 == "lane" && $m != 1 { n++ } END { print n + 0 }')"
+    split_on || echo "pre-v7.1 waiters (the split starts only when this is 0): $(older_waiters)"
     echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
     exit 0
 fi
@@ -289,7 +307,7 @@ w=${BOX_HOLD_WAIT-}
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 # the second line marks a waiter that knows the alternation rule: only such a lane ticket is preferred after a priority
 # turn (a waiter of an older box-hold copy waits for whatever sorts first, and preferring it would stall the queue)
-printf '%s %s %s\nbox-hold-v3\nbox-hold-v6\nbox-hold-v7\ndev=%s\n' "${BOX_HOLD_WHO:-$(id -un)}" "$(date -u +%FT%TZ)" "$*" "$reqdev" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
+printf '%s %s %s\nbox-hold-v3\nbox-hold-v6\nbox-hold-v7\nbox-hold-v7.1\ndev=%s\n' "${BOX_HOLD_WHO:-$(id -un)}" "$(date -u +%FT%TZ)" "$*" "$reqdev" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
 flock -u 7; exec 7>&-
 trap 'rm -f "$Q/$me"' EXIT
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
@@ -318,7 +336,7 @@ EOF
     # act on v6's choice only when that ticket's waiter is a v6 one (marker): otherwise an older waiter could be waiting
     # for a ticket that is waiting for it (the 2026-11-27 21:57Z stall); fall back to v5's choice
     # (v6 picks only tickets of v6 waiters, so the one it picks always starts; v5's choice only when v6 has none)
-    if [ -z "$v6head" ] && [ -z "$FL" ] && [ "$MK" = 6 ]; then head=$v5head   # (split: no fallback, older waiters self-serve)
+    if [ -z "$v6head" ] && [ -z "$FL" ] && [ "$MK" = 6 ]; then head=$v5head   # (split: no fallback; it is only active with no older waiters)
     else head=$v6head; fi
 }
 HELD=""

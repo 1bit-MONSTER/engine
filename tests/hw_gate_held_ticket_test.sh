@@ -35,7 +35,7 @@ sed -n '/^HELD_PID="" HELD_T0=0/,/^box_ticket() {/p' "$gate" | sed '$d' > "$fn"
 grep -q '^hold_for() {' "$fn" && grep -q '^hold_acquire() {' "$fn" && grep -q '^hold_release() {' "$fn" \
   || { echo "FAIL: the held-ticket helpers are no longer where this test finds them"; exit 1; }
 unset GITHUB_ACTIONS GITHUB_RUN_ID
-export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 TMPDIR=$T
+export BOX_HOLD_DIR=$T/locks BOX_HOLD_POLL=0.2 TMPDIR=$T BOX_HOLD_FOCUS_GRACE=1   # v6: short lane-run grace
 free_now() { ( exec 8> "$T/locks/box-gpu.lock"; flock -n 8 ) 2> /dev/null; }   # 0 = nobody holds the GPU lock
 seq_n() { cat "$T/locks/box-seq" 2> /dev/null || echo 0; }
 drive() {   # runs a script in a shell that has the helpers, BOX_HOLD=real box-hold
@@ -66,6 +66,7 @@ for _ in $(seq 20); do free_now && break; sleep 0.5; done
 free_now && ok "a gate killed with SIGKILL frees the lock (its holder exits)" || bad "lock still held after the gate was killed"
 
 # 5. the lock never comes round
+sleep 1.5; : > "$T/locks/box-focus"; : > "$T/locks/box-running"   # v6: no lane run left over from arm 4
 sh "$BH" gpu sleep 4 & sleep 0.5
 W=1 drive 'hold_for 1; echo "rc $?"' > "$T/o5" 2> /dev/null
 grep -q '^rc 4$' "$T/o5" && ok "the lock never coming round: hold_for returns 4" || bad "no-lock rc: $(cat "$T/o5")"

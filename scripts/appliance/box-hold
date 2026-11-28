@@ -36,13 +36,42 @@
 # at a time (a third queues as a lane, reported), the same 45-min cap.
 set -u
 D=${BOX_HOLD_DIR:-/tmp/box-locks}; mkdir -p $D 2>/dev/null; chmod 1777 $D 2>/dev/null; (umask 000; touch $D/box-gpu.lock $D/box-npu.lock $D/box-gpu.who $D/box-npu.who) 2>/dev/null; chmod 666 $D/box-* 2>/dev/null
-dev=${1:?usage: box-hold <gpu|npu|both> <command...>}; shift
+# v5.1 (2026-11-28 orchestrator; found by cl-npuconc): seed the age record of every live lane ticket that has none.
+# v5 writes a job's record on its FIRST v5 submission, so a ticket queued under an older copy had none, and when its
+# wait ran out the re-submission went to the BACK. The ticket file itself holds what the record needs: its queue number
+# (the file name) and the line "<label> <date> <command>" every copy has written. The label and command are split at
+# box-hold's own date token, the one within 2 s of the file's mtime (a label may carry a timestamp of its own).
+# Only a missing record is written, through a temp file and a no-overwrite link, so it is idempotent and atomic.
+# Runs at every submission, every ~60 s in each waiter's loop, and by hand as `box-hold seed`.
+seed_ages() {
+    _A=$D/box-ages _Q=$D/queue
+    (umask 000; mkdir -p "$_A") 2>/dev/null; chmod 1777 "$_A" 2>/dev/null
+    for _f in $(ls "$_Q" 2>/dev/null); do
+        case $_f in 0-*) continue ;; esac
+        _p=${_f#*.}; _p=${_p%%.*}; [ -d "/proc/$_p" ] || continue
+        _n=${_f%%.*}; _n=${_n#1-}; _n=$(printf '%s' "$_n" | sed 's/^0*//'); [ -n "$_n" ] || continue
+        _l=$(head -1 "$_Q/$_f" 2>/dev/null) && _mt=$(stat -c %Y "$_Q/$_f" 2>/dev/null) || continue
+        _w="" _c=""
+        for _d in 0 1 2 -1 -2; do
+            _t=$(date -u -d "@$((_mt - _d))" +%FT%TZ 2>/dev/null) || continue
+            case "$_l" in *" $_t "*) _w=${_l%%" $_t "*}; _c=${_l#*" $_t "}; break ;; esac
+        done
+        [ -n "$_w" ] || continue
+        _k=$(printf '%s\0%s' "$_w" "$_c" | sha256sum | cut -c1-32)
+        [ -e "$_A/$_k" ] && continue
+        (umask 000; printf '%s\n' "$_n" > "$_A/.$_k.$$" && ln "$_A/.$_k.$$" "$_A/$_k"; rm -f "$_A/.$_k.$$") 2>/dev/null
+    done
+}
+if [ "${1:-}" = seed ]; then seed_ages; exit 0; fi
+MODE=run
+if [ "${1:-}" = focus ]; then MODE=focus; set -- both true; fi   # `box-hold focus`: print the lane run state, take no lock (it may advance the focus, as any waiter would)
+dev=${1:?usage: box-hold <gpu|npu|both> <command...> | box-hold seed | box-hold focus}; shift
 [ $# -gt 0 ] || { echo "box-hold: no command" >&2; exit 2; }
 # 2026-11-23 orchestrator: GPU and NPU are never held by two different jobs at once (06:29Z hard reset, reset reason 0x00800800, GPU ticket + separate NPU ticket); every ticket takes both locks until that is understood.
 case $dev in gpu|npu|both) dev=both ;; *) echo "box-hold: gpu, npu or both" >&2; exit 2 ;; esac
 poll=${BOX_HOLD_POLL:-2}
 Q=$D/queue; mkdir -p $Q 2>/dev/null; chmod 1777 $Q 2>/dev/null
-(umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log $D/box-last) 2>/dev/null
+(umask 000; touch $D/box-seq.lock $D/box-seq $D/box-hold.log $D/box-last $D/box-focus.lock $D/box-focus-done $D/box-focus $D/box-running) 2>/dev/null
 starttime() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
 alive() { _p=${1#*.}; _p=${_p%%.*}; _s=${1##*.}; [ -n "$_s" ] && [ "$(starttime "$_p")" = "$_s" ]; }
 under_runner() {   # GITHUB_ACTIONS=true and a Runner.Worker process among this process's ancestors
@@ -65,59 +94,142 @@ case "${BOX_HOLD_PRIORITY:-}" in
     ci)
         if under_runner || [ "$(id -un 2>/dev/null)" = ghrunner ]; then pfx=0- cap=1
         else ignored "not under a GitHub Actions runner, not the runner account"; fi ;;
-    board)   # 2026-11-27 orchestrator: cl-lb's leaderboard tickets only (the weekly blog needs the boards)
-        case "${BOX_HOLD_WHO:-}" in
-            cl-lb|cl-lb[-_\ ]*) pfx=0-b- cap=1 ;;
-            *) ignored "the board class is for the cl-lb label only" ;;
-        esac ;;
+    board)   # v6 (owner 2026-11-28, lane runs): no separate board priority - cl-lb's tickets run as cl-lb's lane run
+        ignored "the board class is folded into lane runs (v6): cl-lb's tickets run when cl-lb has the focus" ;;
     '') ;;
     *) ignored "no such class (ci, board)" ;;
 esac
-# number + ticket under one lock, so the board quota (at most BOX_HOLD_BOARD_MAX queued at a time) cannot be raced past
+# ---- box-hold v6: LANE RUNS (owner 2026-11-28: "stop splitting GPU time between lanes - give the box to ONE lane until
+# its job is done") ----
+# * FOCUS lane = the lane owning the oldest waiting lane ticket. While it has tickets queued, only ITS tickets run, back
+#   to back, in its own submission order (ages, v5). It has no queued cap (others keep BOX_HOLD_LANE_MAX, 2).
+# * It keeps the focus while it re-submits within BOX_HOLD_FOCUS_GRACE (300 s) of its last ticket ending, so a lane that
+#   chains steps is not cut off. The focus passes to the next-oldest lane when the focus lane has had nothing queued or
+#   running for the grace, or after BOX_HOLD_FOCUS_BUDGET (6 h): then it goes to the BACK of the lane order (its tickets
+#   keep their ages) until every other waiting lane has had a turn.
+# * CI tickets (runner account / GitHub Actions: hw-gate, hrx-build, the reviewer window) run BETWEEN lane tickets (they
+#   alternate with the focus lane's), never during one.
+# * Per-ticket timeouts stay (crash safety): a lane ticket at most BOX_HOLD_LANE_MAX_S (5400 s = 90 min, the 45-min fleet
+#   cap lifted for lane runs), a CI ticket BOX_HOLD_CI_MAX (2700).
+# * `box-hold focus` prints the focus lane, its remaining tickets and the lane order after it.
+# State: $D/box-focus ("LANE SINCE LAST"), $D/box-focus-done (lanes that used their budget), $D/box-running (the lane of
+# the running lane ticket), all under $D/box-focus.lock.
+# One awk pass reads the whole queue (liveness, label, lane, markers): the old per-ticket sed/head forks ran every 2 s in
+# every waiter.
+LANES=${BOX_HOLD_LANES:-/etc/1bit/box-hold-lanes.conf}
+FOCUS_GRACE=${BOX_HOLD_FOCUS_GRACE:-300}; FOCUS_BUDGET=${BOX_HOLD_FOCUS_BUDGET:-21600}
+lane_of() {   # <label> -> the lane: its first word's cl-/pi- lane (dashed names from $LANES), or "~<first word>"
+    printf '%s\n' "$1" | awk -v LANES="$LANES" '
+        BEGIN { nl = 0; while ((getline l < LANES) > 0) if (l != "" && l !~ /^#/) lanes[++nl] = l }
+        { w = $1; if (w !~ /^(cl|pi)-./) { print "~" w; exit }
+          b = ""; for (i = 1; i <= nl; i++) if ((w == lanes[i] || index(w, lanes[i] "-") == 1) && length(lanes[i]) > length(b)) b = lanes[i]
+          if (b != "") { print b; exit }; split(w, p, "-"); print p[1] "-" p[2]; exit }'
+}
+scan() {   # the queue, oldest first: "LIVE <name> ci|lane <lane> <v3> <v6>" per live ticket, "DEAD <name>" per dead one
+    ls "$Q" 2>/dev/null | LC_ALL=C sort | awk -v Q="$Q" -v LANES="$LANES" '
+        BEGIN { nl = 0; while ((getline l < LANES) > 0) if (l != "" && l !~ /^#/) lanes[++nl] = l }
+        function laneof(w,   i, b, p) {
+            if (w !~ /^(cl|pi)-./) return "~" w
+            b = ""; for (i = 1; i <= nl; i++) if ((w == lanes[i] || index(w, lanes[i] "-") == 1) && length(lanes[i]) > length(b)) b = lanes[i]
+            if (b != "") return b
+            split(w, p, "-"); return p[1] "-" p[2] }
+        { f = $0; n = split(f, a, "."); if (n < 3) next
+          st = ""; sf = "/proc/" a[2] "/stat"
+          if ((getline x < sf) > 0) { sub(/.*\) /, "", x); split(x, y, " "); st = y[20] }; close(sf)
+          if (st == "" || st != a[n]) { print "DEAD " f; next }
+          tf = Q "/" f; first = ""; v3 = 0; v6 = 0; ln = 0
+          while ((getline l < tf) > 0) { if (++ln == 1) first = l; if (l == "box-hold-v3") v3 = 1; if (l == "box-hold-v6") v6 = 1 }
+          close(tf); split(first, w, " ")
+          kind = (f ~ /^0-/ && f !~ /^0-b-/) ? "ci" : "lane"
+          num = a[1]; sub(/^(0-b-|0-|1-)/, "", num); num = num + 0   # the queue number = the age (whatever the prefix)
+          print "LIVE " f " " kind " " laneof(w[1]) " " v3 " " v6 " " num }'
+}
+# lane tickets oldest first BY QUEUE NUMBER (a 0-b- ticket of the old board class sorts before 1- by name, not by age:
+# measured at the v6 install, 2026-11-28 04:32Z, it handed the focus to cl-lb over cl-hyperloom's older ticket)
+lanes_by_age() { printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "lane"' | sort -k7,7n; }
+# ... and only those a v6 waiter will take (the box-hold-v6 marker): an older copy's waiter never starts on v6's word, so
+# a lane whose queued tickets all have older waiters is IDLE to v6 (2026-11-28 05:10Z: cl-hyperloom held the focus with
+# pre-v6 waiters only and the box sat idle 36 min). Older copies' tickets are skipped by v6; they still take the box by
+# their own rule when they find themselves first.
+v6_lanes_by_age() { lanes_by_age | awk '$6 == 1'; }
+running_lane() {   # the lane of the running lane ticket, if its box-hold is still alive ("LANE PID STARTTIME")
+    read _rl _rp _rs < "$D/box-running" 2>/dev/null || return 0
+    if [ -n "$_rp" ]; then [ "$(starttime "$_rp")" = "$_rs" ] && echo "$_rl"; return 0; fi
+    # a record of the first v6 build (lane only): running only while a lock is held
+    flock -n "$D/box-gpu.lock" true 2> /dev/null && flock -n "$D/box-npu.lock" true 2> /dev/null || echo "$_rl"
+}
+focus_log() { echo "$(date -u +%FT%TZ) box-hold: $*" >> "$D/box-hold.log" 2>/dev/null; }
+update_focus() {   # uses $SCAN; sets FL (the focus lane, empty when no lane waits) and FS / FLAST
+    exec 6>>"$D/box-focus.lock"; flock 6
+    read FL FS FLAST < "$D/box-focus" 2>/dev/null || { FL="" FS=0 FLAST=0; }
+    _now=$(date +%s); _run=$(running_lane)   # a SIGKILLed holder's record is stale, not "running" (review cl-flm)
+    _order=$(v6_lanes_by_age | awk '!s[$4]++ { print $4 }')
+    if [ -n "$FL" ]; then
+        if [ $((_now - FS)) -ge "$FOCUS_BUDGET" ] && [ "$_run" != "$FL" ]; then
+            echo "$FL $_now" >> "$D/box-focus-done"; focus_log "focus: $FL used its ${FOCUS_BUDGET}s budget -> back of the lane order"; FL=""
+        elif ! printf '%s\n' "$_order" | grep -qxF -- "$FL" && [ "$_run" != "$FL" ] && [ $((_now - FLAST)) -ge "$FOCUS_GRACE" ]; then
+            focus_log "focus: $FL has had nothing queued or running for ${FOCUS_GRACE}s -> next lane"; FL=""
+        fi
+    fi
+    if [ -z "$FL" ] && [ -n "$_order" ]; then
+        _done=$(awk '{ print $1 }' "$D/box-focus-done" 2>/dev/null)
+        FL=$(printf '%s\n' "$_order" | awk -v d="$_done" 'BEGIN { n = split(d, x, "\n"); for (i = 1; i <= n; i++) dn[x[i]] = 1 } !($0 in dn) { print; exit }')
+        if [ -z "$FL" ]; then : > "$D/box-focus-done"; FL=$(printf '%s\n' "$_order" | head -1); fi   # everyone had a turn
+        FS=$_now FLAST=$_now
+        echo "$FL $FS $FLAST" > "$D/box-focus" 2>/dev/null   # in place, under the lock: the dir is sticky, a rename over another user's file is refused
+        focus_log "focus -> $FL"
+    elif [ -z "$_order" ] && [ -z "$FL" ]; then :
+    fi
+    flock -u 6; exec 6>&-
+}
+touch_focus() {   # <lane>: the focus lane's last activity is now (a grant or an end of one of its tickets)
+    exec 6>>"$D/box-focus.lock"; flock 6
+    if read _fl _fs _flast < "$D/box-focus" 2>/dev/null && [ "$_fl" = "$1" ]; then
+        echo "$_fl $_fs $(date +%s)" > "$D/box-focus" 2>/dev/null
+    fi
+    flock -u 6; exec 6>&-
+}
+if [ "$MODE" = focus ]; then
+    SCAN=$(scan); update_focus; _now=$(date +%s)
+    if [ -z "$FL" ]; then echo "focus: none (no lane ticket waiting)"
+    else
+        echo "focus: $FL - since $(date -u -d "@$FS" +%FT%TZ 2>/dev/null || echo "$FS") ($(( (_now - FS) / 60 )) of $((FOCUS_BUDGET / 60)) min used), last activity $((_now - FLAST)) s ago, running: $(running_lane)"
+        echo "remaining for $FL:"
+        v6_lanes_by_age | awk -v L="$FL" -v Q="$Q" '$4 == L { getline l < (Q "/" $2); close(Q "/" $2); print "  " $2 "  " substr(l, 1, 70) }'
+    fi
+    echo "then (lane order by oldest ticket; * = had its budget, waits for the others):"
+    _done=$(awk '{ print $1 }' "$D/box-focus-done" 2>/dev/null)
+    v6_lanes_by_age | awk -v L="$FL" -v d="$_done" 'BEGIN { n = split(d, x, "\n"); for (i = 1; i <= n; i++) dn[x[i]] = 1 }
+        $4 != L { c[$4]++; if (!($4 in o)) { o[$4] = ++k; nm[k] = $4 } }
+        END { for (i = 1; i <= k; i++) printf "  %d. %s (%d queued)%s\n", i, nm[i], c[nm[i]], (nm[i] in dn) ? " *" : "" }'
+    for _x in gpu npu; do   # who has the box right now (a CI ticket between lane tickets shows here, not as "running")
+        if flock -n "$D/box-$_x.lock" true 2> /dev/null; then echo "holder $_x: none"
+        else echo "holder $_x: $(cut -c1-100 "$D/box-$_x.who" 2> /dev/null || echo '?')"; fi
+    done
+    echo "older-copy waiters (skipped by v6, they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "lane" && $6 != 1 { n++ } END { print n + 0 }')"
+    echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
+    exit 0
+fi
+# number + ticket under one lock (the lane cap and the age record cannot be raced past)
 exec 7>>"$D/box-seq.lock" || { echo "box-hold: cannot open $D/box-seq.lock" >&2; exit 3; }
 flock 7
 n=$(( $(cat "$D/box-seq" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/box-seq" || { echo "box-hold: cannot write $D/box-seq" >&2; exit 3; }
-if [ "$pfx" = 0-b- ]; then
-    _nb=0
-    for f in $(ls "$Q" 2>/dev/null | grep '^0-b-'); do alive "$f" && _nb=$((_nb + 1)); done
-    if [ "$_nb" -ge "${BOX_HOLD_BOARD_MAX:-2}" ]; then
-        pfx=1- cap=0; ignored "the board class already has $_nb ticket(s) queued, the most it takes"
-    fi
-fi
-# Lane cap (2026-11-27 orchestrator; cl-inkling had 19 queued): at most BOX_HOLD_LANE_MAX (2; 3 until 11-28) QUEUED lane tickets per
-# lane; running tickets do not count (theirs has left the queue), nor do CI and board tickets. A further waiter from the
-# same lane is refused at once (exit 4). The lane is the label's first word when it starts cl- or pi-: its first two
-# dash tokens (cl-inkling-xyz -> cl-inkling), or the longest name in $BOX_HOLD_LANES (one per line) it starts with, for
-# lanes whose own name has a dash (cl-inkling-npu). Labels of no cl-/pi- lane (coder-llm, hw-gate ...) are not capped.
-LANES=${BOX_HOLD_LANES:-/etc/1bit/box-hold-lanes.conf}
-lane_of() {   # <label> -> the lane, or nothing when the label is not a lane's
-    _w=${1%% *}
-    case "$_w" in cl-?*|pi-?*) ;; *) return 0 ;; esac
-    _best=""
-    if [ -r "$LANES" ]; then
-        while IFS= read -r _l; do
-            case "$_l" in ''|'#'*) continue ;; esac
-            case "$_w" in "$_l"|"$_l"-*) [ "${#_l}" -gt "${#_best}" ] && _best=$_l ;; esac
-        done < "$LANES"
-    fi
-    [ -n "$_best" ] && { printf '%s' "$_best"; return 0; }
-    printf '%s' "$_w" | cut -d- -f1-2
-}
+mylane=$(lane_of "${BOX_HOLD_WHO:-$(id -un)}")
 if [ "$pfx" = 1- ]; then
-    _lane=$(lane_of "${BOX_HOLD_WHO:-}")
-    if [ -n "$_lane" ]; then
-        _nq=0
-        for f in $(ls "$Q" 2>/dev/null | grep -v '^0-'); do
-            alive "$f" || continue
-            [ "$(lane_of "$(head -c 300 "$Q/$f" 2>/dev/null)")" = "$_lane" ] && _nq=$((_nq + 1))
-        done
-        if [ "$_nq" -ge "${BOX_HOLD_LANE_MAX:-2}" ]; then
-            flock -u 7
-            _m="box-hold: lane cap: $_nq queued for $_lane (at most ${BOX_HOLD_LANE_MAX:-2} per lane): ${BOX_HOLD_WHO} refused, not queued"
-            echo "$_m" >&2; echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
-            exit 4
-        fi
-    fi
+    case $mylane in
+        "~"*) ;;   # not a cl-/pi- lane: not capped, so no queue scan inside the sequence lock (submissions stay quick)
+        *)
+            SCAN=$(scan); update_focus
+            if [ "$mylane" != "$FL" ]; then   # the focus lane has no queued cap
+                _nq=$(printf '%s\n' "$SCAN" | awk -v L="$mylane" '$1 == "LIVE" && $3 == "lane" && $4 == L { n++ } END { print n + 0 }')
+                if [ "$_nq" -ge "${BOX_HOLD_LANE_MAX:-2}" ]; then
+                    flock -u 7
+                    _m="box-hold: lane cap: $_nq queued for $mylane (at most ${BOX_HOLD_LANE_MAX:-2} per lane while $FL has the focus): ${BOX_HOLD_WHO} refused, not queued"
+                    echo "$_m" >&2; echo "$(date -u +%FT%TZ) $_m" >> "$D/box-hold.log" 2>/dev/null
+                    exit 4
+                fi
+            fi ;;
+    esac
 fi
 # box-hold v5 (2026-11-28 orchestrator: ~37 tickets x ~35 min is longer than any wait, so expired lane tickets went to
 # the back and could starve for ever):
@@ -128,6 +240,7 @@ fi
 #  - a lane ticket waits FOR EVER by default (BOX_HOLD_WAIT unset = 0); an explicit value still bounds it. CI and board
 #    tickets keep the 3600 s default (their callers set their own).
 AGES=$D/box-ages; agekey=""
+[ "$pfx" = 1- ] && seed_ages   # v5.1: old-copy tickets get their record before anything re-submits them
 if [ "$pfx" = 1- ]; then
     (umask 000; mkdir -p "$AGES") 2>/dev/null; chmod 1777 "$AGES" 2>/dev/null
     agekey=$(printf '%s\0%s' "${BOX_HOLD_WHO:-$(id -un)}" "$*" | sha256sum | cut -c1-32)
@@ -143,7 +256,7 @@ w=${BOX_HOLD_WAIT-}
 me=$pfx$(printf '%012d' "$n").$$.$(starttime $$)
 # the second line marks a waiter that knows the alternation rule: only such a lane ticket is preferred after a priority
 # turn (a waiter of an older box-hold copy waits for whatever sorts first, and preferring it would stall the queue)
-printf '%s %s %s\nbox-hold-v3\n' "${BOX_HOLD_WHO:-$(id -un)}" "$(date -u +%FT%TZ)" "$*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
+printf '%s %s %s\nbox-hold-v3\nbox-hold-v6\n' "${BOX_HOLD_WHO:-$(id -un)}" "$(date -u +%FT%TZ)" "$*" > "$Q/$me" 2>/dev/null || { echo "box-hold: cannot write $Q/$me" >&2; exit 3; }
 flock -u 7; exec 7>&-
 trap 'rm -f "$Q/$me"' EXIT
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
@@ -152,28 +265,32 @@ exec 8>$D/box-gpu.lock || { echo "box-hold: cannot open $D/box-gpu.lock" >&2; ex
 exec 9>"$D/box-npu.lock" || { echo "box-hold: cannot open $D/box-npu.lock" >&2; exit 3; }   # no 2>/dev/null here: on a bare exec it would silence stderr for the rest of the script
 # The head TRIES the locks (flock -n) and looks at the queue again between tries, instead of blocking in flock: a head
 # blocked in `flock -w` never sees a CI ticket that arrives behind it, so the CI class could not be served next.
+_si=0
 while :; do
-    # Alternating classes (2026-11-27 orchestrator, fairness v3): CI and board tickets beat lane tickets, but never twice
-    # in a row while a lane ticket waits - with every PR push queueing a CI or reviewer-window ticket, lanes slipped
-    # backwards (cl-kernel's ticket went from 2nd to 36th). $D/box-last says which class the last granted ticket was:
-    # after a CI/board ticket, the oldest waiting LANE ticket is the head. FIFO within each class is unchanged.
-    first="" lane1=""
-    for f in $(ls "$Q" 2>/dev/null | LC_ALL=C sort); do   # C collation: the class prefix must not be ignored
-        if alive "$f"; then
-            [ -n "$first" ] || first=$f
-            # the OLDEST live lane ticket, and only if its waiter knows this rule (marker line): measured 2026-11-27 21:57Z,
-            # an older copy's lane waiter only takes the lock when it sorts first, so preferring it would leave the lock free
-            # for nobody. When the oldest lane ticket is such an unmarked one, no lane is preferred this turn (class order) -
-            # a YOUNGER marked lane ticket must not jump it (review cl-release on #3586: measured 32 of 32 queued lane
-            # tickets unmarked after the install, so every new lane ticket would have overtaken all of them). Alternation
-            # switches on by itself once the pre-v3 waiters have drained.
-            case $f in 0-*) ;; *) grep -qx box-hold-v3 "$Q/$f" 2>/dev/null && lane1=$f; break ;; esac
-        else
-            rm -f "$Q/$f" 2>/dev/null   # a dead waiter's ticket (another user's stays until its owner or root sweeps it; it is skipped either way)
-        fi
-    done
-    head=$first
-    [ -n "$lane1" ] && [ "$(cat "$D/box-last" 2>/dev/null)" = priority ] && head=$lane1
+    _si=$((_si + 1)); [ $((_si % 30)) = 1 ] && seed_ages   # v5.1: keep seeding while waiting (~60 s)
+    SCAN=$(scan)
+    for f in $(printf '%s\n' "$SCAN" | awk '$1 == "DEAD" { print $2 }'); do rm -f "$Q/$f" 2>/dev/null; done   # dead waiters
+    update_focus
+    _last=$(cat "$D/box-last" 2>/dev/null)
+    # v5's choice (what waiters of the previous copies compute, so everyone agrees while they drain): class order, and
+    # after a priority turn the oldest live lane ticket if it is marked
+    v5head=$(printf '%s\n' "$SCAN" | awk -v last="$_last" '$1 != "LIVE" { next } first == "" { first = $2 }
+        $3 == "lane" { if ($5 == 1) lane1 = $2; exit } END { print ((lane1 != "" && last == "priority") ? lane1 : first) }')
+    # v6's choice: CI alternates with the focus lane's tickets; with the focus lane's queue empty (its grace) only CI runs
+    # (read, never `set --`: "$@" is the command this ticket runs)
+    read _ci _ft _ftv6 <<EOF
+$( { printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci"'; v6_lanes_by_age; } | awk -v L="$FL" '$3 == "ci" && ci == "" { ci = $2 }
+        $3 == "lane" && $4 == L && ft == "" { ft = $2; v6 = $6 } END { print (ci == "" ? "-" : ci), (ft == "" ? "-" : ft), v6 + 0 }')
+EOF
+    [ "$_ci" = - ] && _ci=""; [ "$_ft" = - ] && _ft=""
+    if [ -n "$_ft" ] && { [ "$_last" = priority ] || [ -z "$_ci" ]; }; then v6head=$_ft
+    elif [ -n "$_ci" ]; then v6head=$_ci
+    else v6head=""; fi
+    # act on v6's choice only when that ticket's waiter is a v6 one (marker): otherwise an older waiter could be waiting
+    # for a ticket that is waiting for it (the 2026-11-27 21:57Z stall); fall back to v5's choice
+    # (v6 picks only tickets of v6 waiters, so the one it picks always starts; v5's choice only when v6 has none)
+    if [ -z "$v6head" ] && [ -z "$FL" ]; then head=$v5head
+    else head=$v6head; fi
     if [ "$head" = "$me" ]; then
         if flock -n 8; then
             flock -n 9 && break
@@ -194,10 +311,47 @@ echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-gpu.who" 2>/de
 echo "${BOX_HOLD_WHO:-$(id -un)} $(date -u +%FT%TZ) $*" > "$D/box-npu.who" 2>/dev/null
 [ -n "$agekey" ] && rm -f "$AGES/$agekey" 2>/dev/null   # granted: this job's original age is used up
 case $me in 0-*) echo priority ;; *) echo lane ;; esac > "$D/box-last" 2>/dev/null   # the class of this turn (alternation)
+if [ "$pfx" = 1- ]; then echo "$mylane $$ $(starttime $$)" > "$D/box-running" 2>/dev/null; touch_focus "$mylane"; fi   # the lane run goes on (live record)
 # out of the line: the next waiter is head now and waits on the lock; signals behave as before (no deferred trap)
 rm -f "$Q/$me"; trap - EXIT TERM INT HUP
 if [ "$cap" = 1 ]; then
-    timeout -k 30 "${BOX_HOLD_CI_MAX:-2700}" "$@"   # the CI and board classes jump the line, so they may not keep it longer than 45 min
+    timeout -k 30 "${BOX_HOLD_CI_MAX:-2700}" "$@"   # CI jumps the line, so it may not keep it longer than 45 min
 else
-    "$@"
+    timeout -k 30 "${BOX_HOLD_LANE_MAX_S:-5400}" "$@"   # a lane run's ticket: at most 90 min (crash safety; v6 lifts the 45-min cap)
 fi
+rc=$?
+# Leftovers (review cl-flm on #3600): `timeout` signals only the process it started, so a server the command forked keeps
+# the inherited lock descriptors (8/9) and the box stays locked after the ticket ends. Any process other than this one
+# and the queue's waiters (they hold the files open to poll) that still has a lock file open is this ticket's leftover:
+# logged at a normal end; at the deadline (rc 124) sent TERM, then KILL. Processes of another uid (sudo) cannot be
+# read or signalled here; the log says so when the lock stays held.
+leftovers() {   # one find over the fd links (by name), then an inode check of each candidate: a full /proc walk took ~1-2 s on the box
+    _w=$(ls "$Q" 2>/dev/null | sed -n 's/^[^.]*\.\([0-9]*\)\..*/\1/p')
+    _b=${D##*/}
+    find /proc/[0-9]*/fd -maxdepth 1 \( -lname "*/$_b/box-gpu.lock" -o -lname "*/$_b/box-npu.lock" \) 2>/dev/null |
+    while read -r _fd; do
+        [ "$_fd" -ef "$D/box-gpu.lock" ] || [ "$_fd" -ef "$D/box-npu.lock" ] || continue
+        _pid=${_fd#/proc/}; _pid=${_pid%%/*}
+        # a waiter's own children (its `sleep`, its scan subshells) inherit the descriptors too: anything below a waiter or
+        # below this box-hold is not a leftover (a leftover has been re-parented away from us; measured on the box: 17
+        # waiters' `sleep 2`)
+        _a=$_pid _n=0 _skip=0
+        while [ -n "$_a" ] && [ "$_a" -gt 1 ] && [ $_n -lt 12 ]; do
+            if [ "$_a" = $$ ] || printf '%s\n' "$_w" | grep -qx "$_a"; then _skip=1; break; fi
+            _a=$(sed 's/.*) //' "/proc/$_a/stat" 2>/dev/null | cut -d' ' -f2); _n=$((_n + 1))
+        done
+        [ $_skip = 1 ] || echo "$_pid"
+    done | sort -u
+}
+_left=$(exec 8>&- 9>&-; leftovers)   # the subshell inherits 8/9: closed, so it does not count itself
+if [ -n "$_left" ]; then
+    if [ "$rc" = 124 ]; then
+        focus_log "${BOX_HOLD_WHO}: deadline: $(echo $_left | wc -w) leftover process(es) hold the box lock: TERM, then KILL:" $_left
+        kill -TERM $_left 2>/dev/null; sleep "${BOX_HOLD_REAP_GRACE_S:-5}"
+        _left=$(exec 8>&- 9>&-; leftovers); [ -n "$_left" ] && kill -KILL $_left 2>/dev/null
+    else
+        focus_log "${BOX_HOLD_WHO}: ended with $(echo $_left | wc -w) leftover process(es) holding the box lock (left running):" $_left
+    fi
+fi
+if [ "$pfx" = 1- ]; then : > "$D/box-running" 2>/dev/null; touch_focus "$mylane"; fi   # its grace starts now (truncate: another user may own the file)
+exit $rc

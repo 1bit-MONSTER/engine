@@ -47,6 +47,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 namespace onebit::loom {
@@ -133,25 +134,31 @@ inline std::string sha256_of_file(const std::string& path) {
 
 // engine#3619: the verified sha256 of a checkpoint, cached so that a second load of the same unchanged file does not
 // hash it again (17.66 GB took 124-170 s on every load). One file per checkpoint in `dir`, named <st_dev>-<st_ino>,
-// holding "1 <size> <mtime_ns> <sha256> <unix time of the hash>". A cached digest is used only when the file's device,
-// inode, size and mtime_ns (of the file itself, after symlinks) all equal the record's, so a rewrite, a touch, a
-// rename-over or a copy is hashed again.
+// holding "2 <size> <mtime_ns> <ctime_ns> <sha256> <unix time of the hash>". A cached digest is used only when the
+// file's device, inode, size, mtime_ns AND ctime_ns (of the file itself, after symlinks) all equal the record's.
+// ctime is the field that matters (review of #3620): mtime is set from userspace (utimensat, touch -d, cp -p,
+// rsync -t --inplace), so a same-size in-place rewrite with its mtime put back keeps (dev, ino, size, mtime), but the
+// kernel moves ctime on every data or metadata change and no unprivileged call sets it back. A chmod/chown of the
+// file therefore costs one re-hash, the safe direction. st_dev may change across a reboot (overlay, btrfs, removable
+// media): that is a miss too, so keep it in the key. Records of format 1 (no ctime) are misses and are rewritten.
+// The cache assumes nanosecond timestamps; on vfat/exfat (2 s / 10 ms ticks) it is not used (statfs, below).
 // The cache must not become a way to skip the hash: a record is trusted only when it and its directory are owned by
 // this process's user and neither is group/other-writable, and neither is a symlink; anything else is ignored (hashed
 // as before, not written). Writes are atomic (a temp file in the same directory, fsync, rename) and only happen when
 // the file's identity is the same after hashing as before. `dir` empty = no cache.
 struct FileIdentity {
     uint64_t dev = 0, ino = 0, size = 0;
-    int64_t mtime_ns = 0;
+    int64_t mtime_ns = 0, ctime_ns = 0;
     bool operator==(const FileIdentity& o) const {
-        return dev == o.dev && ino == o.ino && size == o.size && mtime_ns == o.mtime_ns;
+        return dev == o.dev && ino == o.ino && size == o.size && mtime_ns == o.mtime_ns && ctime_ns == o.ctime_ns;
     }
 };
 inline std::optional<FileIdentity> file_identity(const std::string& path) {
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::nullopt;
     return FileIdentity{uint64_t(st.st_dev), uint64_t(st.st_ino), uint64_t(st.st_size),
-                        int64_t(st.st_mtim.tv_sec) * 1000000000 + int64_t(st.st_mtim.tv_nsec)};
+                        int64_t(st.st_mtim.tv_sec) * 1000000000 + int64_t(st.st_mtim.tv_nsec),
+                        int64_t(st.st_ctim.tv_sec) * 1000000000 + int64_t(st.st_ctim.tv_nsec)};
 }
 // owned by us, a directory (or a regular file), no group/other write, not a symlink
 inline bool sha_cache_entry_trusted(const std::string& path, bool want_dir) {
@@ -159,6 +166,12 @@ inline bool sha_cache_entry_trusted(const std::string& path, bool want_dir) {
     if (::lstat(path.c_str(), &st) != 0) return false;
     if (want_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) return false;
     return st.st_uid == ::geteuid() && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+// vfat / exfat: 2 s / 10 ms timestamps, so a same-size rewrite inside one tick keeps mtime and ctime
+inline bool coarse_timestamps(const std::string& path) {
+    struct statfs fs {};
+    if (::statfs(path.c_str(), &fs) != 0) return true;   // cannot tell: do not cache
+    return fs.f_type == 0x4d44 /* MSDOS_SUPER_MAGIC */ || fs.f_type == 0x2011BAB0 /* EXFAT_SUPER_MAGIC */;
 }
 // ONEBIT_LOOM_SHA_CACHE > $XDG_STATE_HOME/1bit/loom-route-sha > $HOME/.local/state/1bit/loom-route-sha > "" (no cache)
 inline std::string default_sha_cache_dir(const char* env, const char* xdg_state, const char* home) {
@@ -178,15 +191,21 @@ inline CachedSha sha256_of_file_cached(const std::string& path, const std::strin
     CachedSha out;
     const std::optional<FileIdentity> id = file_identity(path);
     if (!id || dir.empty()) { out.sha = hash(path); return out; }
+    if (coarse_timestamps(path)) {
+        out.sha = hash(path);
+        out.note = "the checkpoint's filesystem has coarse timestamps (vfat/exfat): sha256 not cached";
+        return out;
+    }
     const std::string rec = (std::filesystem::path(dir) / (std::to_string(id->dev) + "-" + std::to_string(id->ino))).string();
     const bool dir_ok = sha_cache_entry_trusted(dir, true);
     if (dir_ok && sha_cache_entry_trusted(rec, false)) {
         std::ifstream in(rec, std::ios::binary);
         int ver = 0;
         uint64_t size = 0;
-        int64_t mtime = 0, when = 0;
+        int64_t mtime = 0, ctime = 0, when = 0;
         std::string sha;
-        if (in >> ver >> size >> mtime >> sha >> when && ver == 1 && size == id->size && mtime == id->mtime_ns &&
+        if (in >> ver && ver == 2 && in >> size >> mtime >> ctime >> sha >> when && size == id->size &&
+            mtime == id->mtime_ns && ctime == id->ctime_ns &&
             sha.size() == 64 && sha.find_first_not_of("0123456789abcdef") == std::string::npos) {
             out.sha = sha;
             out.cached = true;
@@ -214,7 +233,8 @@ inline CachedSha sha256_of_file_cached(const std::string& path, const std::strin
     std::string tmp = rec + ".XXXXXX";
     const int fd = ::mkstemp(tmp.data());
     if (fd < 0) { out.note = "cannot write the sha256 cache in " + dir; return out; }
-    const std::string line = "1 " + std::to_string(id->size) + " " + std::to_string(id->mtime_ns) + " " + out.sha + " " +
+    const std::string line = "2 " + std::to_string(id->size) + " " + std::to_string(id->mtime_ns) + " " +
+                             std::to_string(id->ctime_ns) + " " + out.sha + " " +
                              std::to_string(int64_t(::time(nullptr))) + "\n";
     bool ok = ::fchmod(fd, 0600) == 0 && ::write(fd, line.data(), line.size()) == ssize_t(line.size()) && ::fsync(fd) == 0;
     ok = ::close(fd) == 0 && ok;

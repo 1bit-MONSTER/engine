@@ -21,6 +21,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -161,6 +162,36 @@ int main() {
             c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
             check("cache: and its new record is then a hit", c.cached && n == 2);
 
+            // content: an in-place rewrite of the SAME size (same inode) with its mtime put back -> hashed again on
+            // ctime (review of #3620: rsync -t --inplace, cp -p onto the file, touch -d). The digest is the new bytes'.
+            {
+                const auto was = loom::file_identity(f.string());
+                { std::fstream w(f, std::ios::binary | std::ios::in | std::ios::out); w.seekp(0); w << "x"; }   // "abc" -> "xbc"
+                struct timespec keep[2] = {{0, UTIME_OMIT}, {was->mtime_ns / 1000000000, was->mtime_ns % 1000000000}};
+                ::utimensat(AT_FDCWD, f.c_str(), keep, 0);
+                const auto now2 = loom::file_identity(f.string());
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                check("cache: a same-size in-place rewrite with mtime restored is hashed again (ctime)",
+                      now2->ino == was->ino && now2->size == was->size && now2->mtime_ns == was->mtime_ns && !c.cached &&
+                      n == 3 && c.sha == loom::sha256_of_file(f.string()) && c.sha != abc_sha);
+                std::ofstream(f, std::ios::binary | std::ios::trunc) << "abc";   // back to "abc" for the arms below
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                check("cache: ... and the restored file is hashed once more", !c.cached && n == 4 && c.sha == abc_sha);
+                n = 2;   // the arms below count from here
+            }
+            // a record of format 1 (no ctime) is a miss and is rewritten as format 2
+            {
+                const auto v = loom::file_identity(f.string());
+                const fs::path r1 = cache / (std::to_string(v->dev) + "-" + std::to_string(v->ino));
+                std::ofstream(r1, std::ios::binary | std::ios::trunc) << "1 " << v->size << " " << v->mtime_ns << " " << abc_sha << " 1\n";
+                ::chmod(r1.c_str(), 0600);
+                c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
+                std::ifstream back(r1);
+                int ver = 0;
+                back >> ver;
+                check("cache: a format-1 record is a miss, rewritten as format 2", !c.cached && n == 3 && ver == 2);
+                n = 2;
+            }
             // size: an in-place write that keeps the inode and puts the mtime back -> hashed again on the size
             const auto before = loom::file_identity(f.string());
             std::ofstream(f, std::ios::binary | std::ios::app) << "d";
@@ -200,13 +231,15 @@ int main() {
                   !c.cached && n == 6 && !c.note.empty());
             ::chmod(cache.c_str(), 0700);
             // a forged digest in a trusted record is the owner's own doing; a malformed one is ignored
-            std::ofstream(nrec, std::ios::binary | std::ios::trunc) << "1 " << now->size << " " << now->mtime_ns << " nothex 1\n";
+            std::ofstream(nrec, std::ios::binary | std::ios::trunc) << "2 " << now->size << " " << now->mtime_ns << " " << now->ctime_ns << " nothex 1\n";
             c = loom::sha256_of_file_cached(f.string(), cache.string(), h);
             check("cache: a malformed record is ignored (hashed, rewritten)", !c.cached && n == 7 && c.sha.size() == 64);
             fs::remove(nrec);
             const fs::path link = cache / "decoy";
             fs::create_symlink(dir / "cached.gguf", link);
             check("cache: a symlink is never a trusted record", !loom::sha_cache_entry_trusted(link.string(), false));
+            check("cache: the test's own filesystem has fine timestamps (else the arms above test nothing)",
+                  !loom::coarse_timestamps(f.string()));
             // no cache dir = plain hash; an unreadable file = "" and nothing written
             // a file written while it is hashed: the digest is returned but never cached
             {

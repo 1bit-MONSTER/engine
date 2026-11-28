@@ -73,9 +73,13 @@ loom-fetch huggingface:1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF-loom:chat --m
   name; `gguf_sha256` + `gguf_size` name the exact checkpoint the gate measured. The size is compared
   first, so a file of another size is never hashed; an empty table never reads the model.
   A verified sha256 is cached (engine#3619), so a second load of the same unchanged file does not hash it
-  again (a 17.66 GB GGUF took 124-170 s per load). The key is the file's device, inode, size and `mtime_ns`, and any
-  change to one of them means a new hash: a rewrite, a `touch`, a file renamed over it, a copy. The cache lives in
-  `ONEBIT_LOOM_SHA_CACHE` (set but empty turns it off), else `$XDG_STATE_HOME/1bit/loom-route-sha`, else
+  again (a 17.66 GB GGUF took 124-170 s per load). The key is the file's device, inode, size, `mtime_ns` and
+  `ctime_ns`, and any change to one of them means a new hash: a rewrite, a `touch`, a file renamed over it, a copy.
+  `ctime` is the field that makes it safe. A same-size rewrite in place with its mtime put back (`rsync -t
+  --inplace`, `cp -p` onto the file, `touch -d`) keeps the other four, but the kernel moves `ctime` on every change and
+  userspace cannot set it back. A `chmod` or `chown` of the file costs one re-hash. On vfat/exfat (coarse timestamps)
+  nothing is cached. The cache lives in
+  `ONEBIT_LOOM_SHA_CACHE` (set but empty turns it off, so every load is hashed), else `$XDG_STATE_HOME/1bit/loom-route-sha`, else
   `~/.local/state/1bit/loom-route-sha`. It is one 0600 record per file in a 0700 directory, written atomically. A
   record or directory that is not this user's, is group/other-writable or is a symlink is ignored, so the file is
   hashed as before. A hit logs `sha256 of ... (cached, verified <UTC time>)`.

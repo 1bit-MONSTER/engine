@@ -19,12 +19,14 @@
 # 2026-11-28 (found by cl-220 after the 7.4-rc4 reboot): started from init, sudo kept the boot environment's HOME=/,
 # so every job failed in "Prepare the appliance runner" (mkdir: Permission denied; gh: open /.config/gh/config.yml).
 # HOME is now set to the account's home; the rest of the environment is unchanged.
-# The already-running check is anchored to THIS runner's listener: "Runner.Listener" alone also matched the
-# strixhalo-pr-agent runner (52github-runner-pr-agent), and with that one up first this runner never started.
+# The already-running check is by ACCOUNT: "Runner.Listener" alone also matched the strixhalo-pr-agent runner
+# (52github-runner-pr-agent, user ghrunner), and with that one up first this runner never started. Not by path: after a
+# runner self-update the listener may run as ./bin/Runner.Listener (review cl-flm, #3609), and the pr-agent one could
+# too, so only the user tells them apart.
 D=${GITHUB_RUNNER_DIR:-/home/bcloud/actions-runner}
 case "${1:-start}" in
   start)
-    if ! pgrep -f "^$D/bin/Runner.Listener" > /dev/null 2>&1; then
+    if ! pgrep -u bcloud -f 'Runner\.Listener( |$)' > /dev/null 2>&1; then
       sudo -H -u bcloud env HOME=/home/bcloud bash -c "cd $D && setsid nohup ./run.sh > runner.log 2>&1 < /dev/null &" 2> /dev/null
     fi
     ;;

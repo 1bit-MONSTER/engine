@@ -43,7 +43,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 touch "$scratch/zaya.gguf"
 pids=()
-cleanup() { for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; rm -rf "$scratch"; }
+# deadport() runs inside $( ) - a subshell - so its pids+=( ) never reaches this shell's array: its sleepers are also
+# listed in $scratch/deadport.pids. Unkilled, each outlived the test for 600 s holding every fd it inherited, a
+# caller's flock included: ryzen's heavy-job lock stayed held after a whole ctest run (cl-flm, 2026-11-28).
+cleanup() {
+    for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
+    [ -f "$scratch/deadport.pids" ] && while read -r p; do kill -9 "$p" 2>/dev/null; done < "$scratch/deadport.pids"
+    rm -rf "$scratch"
+}
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
@@ -61,7 +68,7 @@ deadport() {
 s = socket.socket(); s.bind(("127.0.0.1", 0))
 open(sys.argv[1], "w").write(str(s.getsockname()[1]))
 time.sleep(600)' "$pf" >/dev/null 2>&1 &
-    pids+=($!)
+    pids+=($!); echo "$!" >> "$scratch/deadport.pids"   # the file reaches cleanup(); the array does not (subshell)
     for _ in $(seq 1 200); do [ -s "$pf" ] && break; sleep 0.02; done
     cat "$pf"
 }

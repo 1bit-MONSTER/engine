@@ -23,6 +23,7 @@
 #   4. a 'both' ticket starts only when both devices are free, and blocks new starts on both while it waits
 #   5. the switch is read at every poll: a gpu waiter queued while it was off takes only the GPU once it is on
 #   6. `box-hold focus` prints both devices' lane runs when split
+#   7. with the switch off, `box-hold focus` counts the pre-v7 waiters (when to switch on)
 set -uo pipefail
 BH=${1:?usage: box_hold_split_test.sh <box-hold>}
 T=$(mktemp -d) || exit 1
@@ -54,7 +55,7 @@ grep -q "free npu G" "$T/probe" && grep -q "held gpu N" "$T/probe" && ok "  ... 
 
 # 3. per-device lane runs
 reset; touch "$T/split"
-L cl-a gpu A1 0.6 & sleep 0.2; L cl-b gpu B1 0.2 & sleep 0.2; L cl-a gpu A2 0.4 & sleep 0.1; L cl-c npu C1 0.8 &
+L cl-a gpu A1 2 & sleep 0.2; L cl-b gpu B1 0.2 & sleep 0.2; L cl-a gpu A2 0.4 & sleep 0.1; L cl-c npu C1 0.8 &   # A1 2 s: C1 (queued at 0.5 s) starts inside it even on the box
 wait
 g=$(awk '$1 == "S" && $2 ~ /^[AB]/ { printf "%s ", $2 }' "$T/log")
 [ "$g" = "A1 A2 B1 " ] && ok "split: the gpu focus lane ran back to back: $g" || bad "gpu focus: $g ($(seq_))"
@@ -89,6 +90,14 @@ out=$(sh "$BH" focus)
 echo "$out" | grep -q "^split devices: ON" && echo "$out" | grep -A1 "^== gpu" | grep -q "^focus: cl-a" && echo "$out" | grep -A1 "^== npu" | grep -q "^focus: cl-c" \
   && ok "box-hold focus prints both lane runs (gpu: cl-a, npu: cl-c)" || bad "focus print: $out"
 wait
+
+# 7. switch off: focus counts the waiters a split would skip (no v7 marker), so the trial knows when to switch on
+reset; rm -f "$T/split"; mkdir -p "$T/locks/queue"
+sleep 30 & p1=$!; s1=$(sed 's/.*) //' "/proc/$p1/stat" | cut -d' ' -f20)
+printf 'cl-old %s x\nbox-hold-v3\nbox-hold-v6\n' "$(date -u +%FT%TZ)" > "$T/locks/queue/1-$(printf '%012d' 7).$p1.$s1"
+out=$(sh "$BH" focus)
+echo "$out" | grep -q "^pre-v7 waiters (switch the split on when this is 0.*: 1$" && ok "switch off: box-hold focus counts the pre-v7 waiters (1)" || bad "pre-v7 count: $out"
+kill "$p1" 2> /dev/null; wait "$p1" 2> /dev/null
 
 [ "$fail" = 0 ] && echo "box_hold_split: PASS" || echo "box_hold_split: FAIL"
 exit "$fail"

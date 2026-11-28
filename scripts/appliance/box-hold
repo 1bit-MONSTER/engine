@@ -237,6 +237,7 @@ if [ "$MODE" = focus ]; then
     done
     split_on && _mk=9 || _mk=6
     echo "older-copy waiters (skipped by v$((_mk == 9 ? 7 : 6)), they take the box by their own rule when first): $(printf '%s\n' "$SCAN" | awk -v m=$_mk '$1 == "LIVE" && $3 == "lane" && $m != 1 { n++ } END { print n + 0 }')"
+    split_on || echo "pre-v7 waiters (switch the split on when this is 0: while split they are skipped and take both locks by their own rule): $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $9 != 1 { n++ } END { print n + 0 }')"
     echo "CI tickets waiting: $(printf '%s\n' "$SCAN" | awk '$1 == "LIVE" && $3 == "ci" { n++ } END { print n + 0 }') (they alternate with the focus lane's tickets)"
     exit 0
 fi
